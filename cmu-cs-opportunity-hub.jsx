@@ -474,7 +474,7 @@ async function fetchCategoryAnthropic(prompt, apiKey) {
 
 /* ------------------------------ Storage keys ----------------------------- */
 const KEY_CACHE = "cmu-opps-cache";      // { list, lastUpdated }
-const KEY_USER = "cmu-opps-user-data";   // { saved, notes, tracker }
+const KEY_USER = "cmu-opps-user-data";   // { saved, notes, tracker, hidden, overrides }
 const KEY_SETTINGS = "cmu-opps-settings";// { autoRefresh, introDismissed }
 
 async function storageLoad(key) {
@@ -525,6 +525,17 @@ function Star({ on, onClick }) {
   );
 }
 
+function HideButton({ hidden, onClick }) {
+  return (
+    <button onClick={(e) => { e.stopPropagation(); onClick(); }}
+      aria-label={hidden ? "Unhide" : "Hide"} title={hidden ? "Show this again" : "Hide — not interested"}
+      className="text-sm leading-none px-1 rounded hover:scale-110 transition-transform"
+      style={{ color: hidden ? C.red : "#C9C4BB" }}>
+      {hidden ? "↺" : "✕"}
+    </button>
+  );
+}
+
 function NewBadge() {
   return (
     <span className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider"
@@ -558,7 +569,7 @@ export default function CMUOpportunityHub() {
   const [fetchError, setFetchError] = useState(null);
   const [toast, setToast] = useState(null);
 
-  const [userData, setUserData] = useState({ saved: [], notes: {}, tracker: {} });
+  const [userData, setUserData] = useState({ saved: [], notes: {}, tracker: {}, hidden: [], overrides: {} });
   const [settings, setSettings] = useState({ autoRefresh: false, introDismissed: false });
 
   const [view, setView] = useState("browse");
@@ -569,7 +580,7 @@ export default function CMUOpportunityHub() {
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [layout, setLayout] = useState("grid");
-  const [filters, setFilters] = useState({ types: [], loc: "all", paid: "all", year: "all", tags: [], savedOnly: false });
+  const [filters, setFilters] = useState({ types: [], loc: "all", paid: "all", year: "all", tags: [], savedOnly: false, showHidden: false });
   const [sortBy, setSortBy] = useState("deadline");
   const [showFilters, setShowFilters] = useState(false);
 
@@ -668,7 +679,10 @@ export default function CMUOpportunityHub() {
         storageLoad(KEY_CACHE), storageLoad(KEY_USER), storageLoad(KEY_SETTINGS),
       ]);
       if (user && typeof user === "object") {
-        setUserData({ saved: user.saved || [], notes: user.notes || {}, tracker: user.tracker || {} });
+        setUserData({
+          saved: user.saved || [], notes: user.notes || {}, tracker: user.tracker || {},
+          hidden: user.hidden || [], overrides: user.overrides || {},
+        });
       }
       if (setts && typeof setts === "object") {
         setSettings({ autoRefresh: !!setts.autoRefresh, introDismissed: !!setts.introDismissed });
@@ -704,20 +718,30 @@ export default function CMUOpportunityHub() {
   }, [settings.autoRefresh, refresh]);
 
   /* ------------------------------ derived data ---------------------------- */
+  // User edits layer on top of fetched data, so they survive feed refreshes.
+  const displayed = useMemo(() => {
+    const ov = userData.overrides || {};
+    return opportunities.map((o) => (ov[o.id] ? { ...o, ...ov[o.id], id: o.id } : o));
+  }, [opportunities, userData.overrides]);
+
+  const hiddenSet = useMemo(() => new Set(userData.hidden), [userData.hidden]);
+  const visible = useMemo(() => displayed.filter((o) => !hiddenSet.has(o.id)), [displayed, hiddenSet]);
+
   const byId = useMemo(() => {
     const m = {};
-    opportunities.forEach((o) => { m[o.id] = o; });
+    displayed.forEach((o) => { m[o.id] = o; });
     return m;
-  }, [opportunities]);
+  }, [displayed]);
 
   const allTags = useMemo(() => {
     const s = new Set();
-    opportunities.forEach((o) => (o.tags || []).forEach((t) => s.add(t)));
+    displayed.forEach((o) => (o.tags || []).forEach((t) => s.add(t)));
     return [...s].sort();
-  }, [opportunities]);
+  }, [displayed]);
 
   const filtered = useMemo(() => {
-    let list = opportunities.filter((o) => {
+    let list = displayed.filter((o) => {
+      if (!filters.showHidden && hiddenSet.has(o.id)) return false;
       if (filters.savedOnly && !userData.saved.includes(o.id)) return false;
       if (filters.types.length && !filters.types.includes(o.type)) return false;
       if (filters.loc !== "all" && locCategory(o) !== filters.loc) return false;
@@ -745,18 +769,36 @@ export default function CMUOpportunityHub() {
       compensation: (a, b) => compValue(b.compensation) - compValue(a.compensation),
     };
     return [...list].sort(sorters[sortBy] || sorters.deadline);
-  }, [opportunities, filters, search, sortBy, userData.saved]);
+  }, [displayed, hiddenSet, filters, search, sortBy, userData.saved]);
 
   const dueSoon = useMemo(() =>
-    opportunities.filter((o) => { const d = daysUntil(o.deadline); return d != null && d >= 0 && d <= 3; })
+    visible.filter((o) => { const d = daysUntil(o.deadline); return d != null && d >= 0 && d <= 3; })
       .sort((a, b) => daysUntil(a.deadline) - daysUntil(b.deadline)),
-    [opportunities]);
+    [visible]);
 
   /* ------------------------------ user actions ---------------------------- */
   const toggleSave = (id) => setUserData((u) => ({
     ...u, saved: u.saved.includes(id) ? u.saved.filter((x) => x !== id) : [...u.saved, id],
   }));
   const setNote = (id, note) => setUserData((u) => ({ ...u, notes: { ...u.notes, [id]: note } }));
+  const toggleHidden = (id) => {
+    const wasHidden = userData.hidden.includes(id);
+    setUserData((u) => ({
+      ...u, hidden: u.hidden.includes(id) ? u.hidden.filter((x) => x !== id) : [...u.hidden, id],
+    }));
+    setToast(wasHidden ? "Opportunity restored" : "Hidden — find it again under Filters → Show hidden");
+  };
+  const saveEdit = (id, fields) => {
+    setUserData((u) => ({ ...u, overrides: { ...u.overrides, [id]: fields } }));
+    setToast("Changes saved");
+  };
+  const resetEdit = (id) => {
+    setUserData((u) => {
+      const ov = { ...u.overrides }; delete ov[id];
+      return { ...u, overrides: ov };
+    });
+    setToast("Restored original listing");
+  };
   const addToTracker = (opp) => setUserData((u) => {
     if (u.tracker[opp.id]) return u;
     return {
@@ -799,11 +841,11 @@ export default function CMUOpportunityHub() {
     downloadFile("cmu-opportunity-hub-export.csv", rows.map((r) => r.map(csvEscape).join(",")).join("\n"), "text/csv");
   };
 
-  const clearFilters = () => setFilters({ types: [], loc: "all", paid: "all", year: "all", tags: [], savedOnly: false });
+  const clearFilters = () => setFilters({ types: [], loc: "all", paid: "all", year: "all", tags: [], savedOnly: false, showHidden: false });
   const activeFilterCount =
     filters.types.length + filters.tags.length +
     (filters.loc !== "all" ? 1 : 0) + (filters.paid !== "all" ? 1 : 0) +
-    (filters.year !== "all" ? 1 : 0) + (filters.savedOnly ? 1 : 0);
+    (filters.year !== "all" ? 1 : 0) + (filters.savedOnly ? 1 : 0) + (filters.showHidden ? 1 : 0);
 
   const modalOpp = modalId ? byId[modalId] : null;
 
@@ -934,7 +976,8 @@ export default function CMUOpportunityHub() {
       <main className="max-w-6xl mx-auto px-4 py-5">
         {view === "browse" && (
           <BrowseView
-            filtered={filtered} total={opportunities.length}
+            filtered={filtered} total={filters.showHidden ? displayed.length : visible.length}
+            hiddenCount={userData.hidden.length}
             searchInput={searchInput} setSearchInput={setSearchInput}
             layout={layout} setLayout={setLayout}
             filters={filters} setFilters={setFilters}
@@ -942,12 +985,13 @@ export default function CMUOpportunityHub() {
             showFilters={showFilters} setShowFilters={setShowFilters}
             allTags={allTags} activeFilterCount={activeFilterCount} clearFilters={clearFilters}
             saved={userData.saved} toggleSave={toggleSave} openModal={setModalId}
+            hidden={userData.hidden} toggleHidden={toggleHidden}
             refreshing={refreshing}
           />
         )}
         {view === "calendar" && (
           <CalendarView
-            opportunities={opportunities} calMonth={calMonth} setCalMonth={setCalMonth}
+            opportunities={visible} calMonth={calMonth} setCalMonth={setCalMonth}
             calSelected={calSelected} setCalSelected={setCalSelected} openModal={setModalId}
           />
         )}
@@ -960,7 +1004,7 @@ export default function CMUOpportunityHub() {
           />
         )}
         {view === "dashboard" && (
-          <DashboardView opportunities={opportunities} userData={userData} openModal={setModalId} />
+          <DashboardView opportunities={visible} userData={userData} openModal={setModalId} />
         )}
       </main>
 
@@ -971,6 +1015,10 @@ export default function CMUOpportunityHub() {
           saved={userData.saved.includes(modalOpp.id)} toggleSave={() => toggleSave(modalOpp.id)}
           inTracker={!!userData.tracker[modalOpp.id]} addToTracker={() => addToTracker(modalOpp)}
           note={userData.notes[modalOpp.id] || ""} setNote={(n) => setNote(modalOpp.id, n)}
+          isHidden={userData.hidden.includes(modalOpp.id)} toggleHidden={() => toggleHidden(modalOpp.id)}
+          edited={!!userData.overrides[modalOpp.id]}
+          onSaveEdit={(fields) => saveEdit(modalOpp.id, fields)}
+          onResetEdit={() => resetEdit(modalOpp.id)}
         />
       )}
 
@@ -992,9 +1040,10 @@ export default function CMUOpportunityHub() {
 /* =============================== BROWSE VIEW ============================== */
 function BrowseView(props) {
   const {
-    filtered, total, searchInput, setSearchInput, layout, setLayout,
+    filtered, total, hiddenCount, searchInput, setSearchInput, layout, setLayout,
     filters, setFilters, sortBy, setSortBy, showFilters, setShowFilters,
-    allTags, activeFilterCount, clearFilters, saved, toggleSave, openModal, refreshing,
+    allTags, activeFilterCount, clearFilters, saved, toggleSave, openModal,
+    hidden, toggleHidden, refreshing,
   } = props;
 
   const toggleType = (t) => setFilters((f) => ({
@@ -1089,6 +1138,14 @@ function BrowseView(props) {
                 Saved only ★
               </label>
             </div>
+            <div>
+              <div className="text-xs font-bold uppercase tracking-wider mb-1.5" style={{ color: C.faint }}>Hidden</div>
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={filters.showHidden}
+                  onChange={(e) => setFilters((f) => ({ ...f, showHidden: e.target.checked }))} />
+                Show hidden{hiddenCount ? ` (${hiddenCount})` : ""}
+              </label>
+            </div>
           </div>
           {allTags.length > 0 && (
             <div className="mt-4">
@@ -1115,13 +1172,16 @@ function BrowseView(props) {
           {filters.paid !== "all" && <Chip label={filters.paid === "paid" ? "Paid only" : "Unpaid / credit"} onRemove={() => setFilters((f) => ({ ...f, paid: "all" }))} />}
           {filters.year !== "all" && <Chip label={filters.year} onRemove={() => setFilters((f) => ({ ...f, year: "all" }))} />}
           {filters.savedOnly && <Chip label="Saved ★" onRemove={() => setFilters((f) => ({ ...f, savedOnly: false }))} />}
+          {filters.showHidden && <Chip label="Showing hidden" onRemove={() => setFilters((f) => ({ ...f, showHidden: false }))} />}
           {filters.tags.map((t) => <Chip key={t} label={"#" + t} onRemove={() => toggleTag(t)} />)}
           <button onClick={clearFilters} className="text-xs font-semibold underline" style={{ color: C.red }}>Clear all</button>
         </div>
       )}
 
       <div className="text-xs mb-3" style={{ color: C.faint }}>
-        Showing {filtered.length} of {total} opportunities{refreshing ? " · fetching fresh listings…" : ""}
+        Showing {filtered.length} of {total} opportunities
+        {hiddenCount > 0 && !filters.showHidden ? ` · ${hiddenCount} hidden` : ""}
+        {refreshing ? " · fetching fresh listings…" : ""}
       </div>
 
       {/* Results */}
@@ -1140,7 +1200,8 @@ function BrowseView(props) {
       ) : layout === "grid" ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {filtered.map((o) => (
-            <OppCard key={o.id} o={o} saved={saved.includes(o.id)} toggleSave={() => toggleSave(o.id)} onOpen={() => openModal(o.id)} />
+            <OppCard key={o.id} o={o} saved={saved.includes(o.id)} toggleSave={() => toggleSave(o.id)}
+              isHidden={hidden.includes(o.id)} toggleHidden={() => toggleHidden(o.id)} onOpen={() => openModal(o.id)} />
           ))}
         </div>
       ) : (
@@ -1160,8 +1221,11 @@ function BrowseView(props) {
             <tbody>
               {filtered.map((o) => (
                 <tr key={o.id} onClick={() => openModal(o.id)} className="cursor-pointer hover:bg-black hover:bg-opacity-5"
-                  style={{ borderBottom: `1px solid ${C.line}` }}>
-                  <td className="px-3 py-2"><Star on={saved.includes(o.id)} onClick={() => toggleSave(o.id)} /></td>
+                  style={{ borderBottom: `1px solid ${C.line}`, opacity: hidden.includes(o.id) ? 0.55 : 1 }}>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <Star on={saved.includes(o.id)} onClick={() => toggleSave(o.id)} />
+                    <HideButton hidden={hidden.includes(o.id)} onClick={() => toggleHidden(o.id)} />
+                  </td>
                   <td className="px-3 py-2">
                     <div className="font-semibold flex items-center gap-2">{o.title} {isNew(o) && <NewBadge />}</div>
                     <div className="text-xs" style={{ color: C.iron }}>{o.organization}</div>
@@ -1193,11 +1257,11 @@ function railColor(o) {
   return "#C9C4BB";
 }
 
-function OppCard({ o, saved, toggleSave, onOpen }) {
+function OppCard({ o, saved, toggleSave, isHidden, toggleHidden, onOpen }) {
   return (
     <div onClick={onOpen}
       className="rounded-lg p-4 cursor-pointer transition-shadow hover:shadow-md flex flex-col gap-2"
-      style={{ background: C.card, border: `1px solid ${C.line}`, borderLeft: `4px solid ${railColor(o)}` }}>
+      style={{ background: C.card, border: `1px solid ${C.line}`, borderLeft: `4px solid ${railColor(o)}`, opacity: isHidden ? 0.55 : 1 }}>
       <div className="flex items-start gap-2">
         <div className="flex-1">
           <div className="font-semibold leading-snug flex items-center gap-2 flex-wrap" style={{ fontFamily: SERIF, fontSize: 16 }}>
@@ -1206,6 +1270,7 @@ function OppCard({ o, saved, toggleSave, onOpen }) {
           <div className="text-xs mt-0.5" style={{ color: C.iron }}>{o.organization}</div>
         </div>
         <Star on={saved} onClick={toggleSave} />
+        <HideButton hidden={isHidden} onClick={toggleHidden} />
       </div>
       <div className="flex flex-wrap gap-1.5 items-center">
         <TypeBadge type={o.type} />
@@ -1221,7 +1286,8 @@ function OppCard({ o, saved, toggleSave, onOpen }) {
 }
 
 /* ============================== DETAIL MODAL ============================== */
-function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker, note, setNote }) {
+function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker, note, setNote, isHidden, toggleHidden, edited, onSaveEdit, onResetEdit }) {
+  const [editing, setEditing] = useState(false);
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
@@ -1233,12 +1299,27 @@ function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker,
       <div onClick={(e) => e.stopPropagation()}
         className="w-full sm:max-w-2xl max-h-[90vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl p-5 sm:p-6"
         style={{ background: C.card }}>
+        {editing ? (
+          <EditForm opp={opp} edited={edited}
+            onCancel={() => setEditing(false)}
+            onSave={(fields) => { onSaveEdit(fields); setEditing(false); }}
+            onReset={() => { onResetEdit(); setEditing(false); }} />
+        ) : (
+        <>
         <div className="flex items-start gap-3">
           <div className="flex-1">
             <div className="flex items-center gap-2 flex-wrap mb-1">
               <TypeBadge type={opp.type} />
               <DeadlinePill deadline={opp.deadline} />
               {isNew(opp) && <NewBadge />}
+              {edited && (
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider"
+                  style={{ background: C.mist, color: C.iron }}>Edited by you</span>
+              )}
+              {isHidden && (
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider"
+                  style={{ background: "#F0EEEA", color: C.faint }}>Hidden</span>
+              )}
             </div>
             <h2 className="leading-tight" style={{ fontFamily: SERIF, fontSize: 24 }}>{opp.title}</h2>
             <div className="text-sm mt-0.5" style={{ color: C.iron }}>{opp.organization}</div>
@@ -1288,8 +1369,146 @@ function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker,
             style={{ background: C.ink, color: "#fff" }}>
             {inTracker ? "✓ In tracker" : "+ Add to tracker"}
           </button>
+          <button onClick={() => setEditing(true)} className="px-4 py-2 rounded-lg font-semibold text-sm"
+            style={{ background: C.mist, color: C.ink, border: `1px solid ${C.line}` }}>
+            ✎ Edit
+          </button>
+          <button onClick={toggleHidden} className="px-4 py-2 rounded-lg font-semibold text-sm"
+            style={{ background: C.mist, color: isHidden ? C.ink : C.iron, border: `1px solid ${C.line}` }}>
+            {isHidden ? "↺ Unhide" : "✕ Hide"}
+          </button>
+        </div>
+        </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------- Edit form ------------------------------- */
+function EditForm({ opp, edited, onSave, onCancel, onReset }) {
+  const [form, setForm] = useState({
+    title: opp.title,
+    organization: opp.organization,
+    type: opp.type,
+    location: opp.location,
+    remote: !!opp.remote,
+    description: opp.description || "",
+    rolling: opp.deadline === "Rolling",
+    deadlineDate: opp.deadline === "Rolling" ? "" : opp.deadline,
+    compensation: opp.compensation || "",
+    eligibility: opp.eligibility || "",
+    tags: (opp.tags || []).join(", "),
+    applyUrl: opp.applyUrl || "",
+  });
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+  const canSave = form.title.trim() && form.organization.trim();
+
+  const submit = () => {
+    if (!canSave) return;
+    onSave({
+      title: form.title.trim(),
+      organization: form.organization.trim(),
+      type: form.type,
+      location: form.location.trim() || "See listing",
+      remote: form.remote,
+      description: form.description.trim(),
+      deadline: form.rolling || !form.deadlineDate ? "Rolling" : form.deadlineDate,
+      compensation: form.compensation.trim() || "See listing",
+      eligibility: form.eligibility.trim() || "Undergraduates",
+      tags: form.tags.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean),
+      applyUrl: form.applyUrl.trim(),
+    });
+  };
+
+  const inputStyle = { border: `1px solid ${C.line}`, background: C.paper };
+  const Label = ({ children }) => (
+    <div className="text-xs font-bold uppercase tracking-wider mb-1" style={{ color: C.faint }}>{children}</div>
+  );
+
+  return (
+    <div>
+      <div className="flex items-start gap-3 mb-4">
+        <h2 className="flex-1 leading-tight" style={{ fontFamily: SERIF, fontSize: 22 }}>Edit opportunity</h2>
+        <button onClick={onCancel} className="text-2xl leading-none px-2 hover:opacity-60" style={{ color: C.iron }}>×</button>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3 text-sm">
+        <div className="sm:col-span-2">
+          <Label>Title *</Label>
+          <input value={form.title} onChange={set("title")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div>
+          <Label>Organization *</Label>
+          <input value={form.organization} onChange={set("organization")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div>
+          <Label>Type</Label>
+          <select value={form.type} onChange={set("type")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle}>
+            {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <div>
+          <Label>Location</Label>
+          <input value={form.location} onChange={set("location")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div className="flex items-end pb-2">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={form.remote} onChange={set("remote")} /> Remote
+          </label>
+        </div>
+        <div>
+          <Label>Deadline</Label>
+          <div className="flex items-center gap-3">
+            <input type="date" value={form.deadlineDate} onChange={set("deadlineDate")} disabled={form.rolling}
+              className="px-3 py-2 rounded-lg outline-none disabled:opacity-50" style={inputStyle} />
+            <label className="flex items-center gap-1.5 cursor-pointer whitespace-nowrap">
+              <input type="checkbox" checked={form.rolling} onChange={set("rolling")} /> Rolling
+            </label>
+          </div>
+        </div>
+        <div>
+          <Label>Compensation</Label>
+          <input value={form.compensation} onChange={set("compensation")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div className="sm:col-span-2">
+          <Label>Eligibility</Label>
+          <input value={form.eligibility} onChange={set("eligibility")} className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div className="sm:col-span-2">
+          <Label>Description</Label>
+          <textarea value={form.description} onChange={set("description")} rows={4}
+            className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div className="sm:col-span-2">
+          <Label>Tags (comma-separated)</Label>
+          <input value={form.tags} onChange={set("tags")} placeholder="machine learning, systems, paid"
+            className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
+        </div>
+        <div className="sm:col-span-2">
+          <Label>Application URL</Label>
+          <input value={form.applyUrl} onChange={set("applyUrl")} placeholder="https://…"
+            className="w-full px-3 py-2 rounded-lg outline-none" style={inputStyle} />
         </div>
       </div>
+
+      <div className="flex flex-wrap items-center gap-2 mt-5">
+        <button onClick={submit} disabled={!canSave}
+          className="px-4 py-2 rounded-lg font-semibold text-sm text-white disabled:opacity-50" style={{ background: C.red }}>
+          Save changes
+        </button>
+        <button onClick={onCancel} className="px-4 py-2 rounded-lg font-semibold text-sm"
+          style={{ background: C.mist, color: C.ink, border: `1px solid ${C.line}` }}>
+          Cancel
+        </button>
+        {edited && (
+          <button onClick={onReset} className="ml-auto px-4 py-2 rounded-lg font-semibold text-sm"
+            style={{ background: "transparent", color: C.red, border: `1px solid #F0C6CE` }}>
+            Reset to original
+          </button>
+        )}
+      </div>
+      {!canSave && <div className="text-xs mt-2" style={{ color: C.red }}>Title and organization are required.</div>}
     </div>
   );
 }
