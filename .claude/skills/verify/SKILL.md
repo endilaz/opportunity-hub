@@ -30,5 +30,7 @@ Flows worth driving:
 
 ## Gotchas
 
+- A real `.env.local` may exist with a live Gemini key — Vite loads it for every server. To force a specific key scenario, set the var on the command line (shell env overrides `.env.local`); an empty-string shell var does NOT override, so use a fake value to test failure paths. A truly keyless run requires temporarily renaming `.env.local`.
+
 - Live Gemini/Anthropic categories need real keys; a fake key exercises the partial-failure path (feed succeeds, LLM categories 400, no red banner).
 - Playwright always starts with a fresh profile, so every run is a cold boot (empty cache → boot refresh always fires).

@@ -5,7 +5,7 @@ import {
 
 /* ============================================================================
    CMU CS OPPORTUNITY HUB
-   A self-updating research & internship hub for CMU CS undergrads.
+   A self-updating research, internship & hackathon hub for CMU CS undergrads.
    - Live data: free SimplifyJobs internship feed (no key) + Gemini free tier
      with Google Search grounding (Anthropic as optional paid fallback)
    - Persistent storage via window.storage (never localStorage)
@@ -140,11 +140,46 @@ const SEED_OPPORTUNITIES = [
     deadline: "Rolling", compensation: "Hourly pay", eligibility: "Local undergraduates; systems interest a plus",
     tags: ["systems", "HPC", "internship"], applyUrl: "https://www.psc.edu/careers/",
   },
+  {
+    id: "tartanhacks", title: "TartanHacks", organization: "CMU ScottyLabs",
+    type: "Hackathon", location: "Pittsburgh, PA", remote: false,
+    description: "CMU's largest hackathon, run by ScottyLabs each spring. A weekend of building with workshops, mentorship, and sponsor prizes — beginner-friendly and on your doorstep. Applications typically open in the winter.",
+    deadline: "2027-01-15", compensation: "Free to attend + prizes", eligibility: "All students; CMU-hosted",
+    tags: ["hackathon", "cmu", "beginner friendly"], applyUrl: "https://tartanhacks.com/",
+  },
+  {
+    id: "hackmit", title: "HackMIT", organization: "MIT",
+    type: "Hackathon", location: "Cambridge, MA", remote: false,
+    description: "One of the largest and most reputable collegiate hackathons, held each fall at MIT. Admissions-based with travel reimbursement for many admitted hackers. Applications typically run in late summer.",
+    deadline: "2026-08-15", compensation: "Free to attend + travel reimbursement + prizes", eligibility: "Undergraduates worldwide",
+    tags: ["hackathon", "flagship"], applyUrl: "https://hackmit.org/",
+  },
+  {
+    id: "pennapps", title: "PennApps", organization: "University of Pennsylvania",
+    type: "Hackathon", location: "Philadelphia, PA", remote: false,
+    description: "The original college hackathon, hosted at Penn every fall. Large sponsor presence, strong recruiting pipeline, and routes for first-time hackers. Applications typically open mid-summer.",
+    deadline: "2026-08-20", compensation: "Free to attend + prizes", eligibility: "All students",
+    tags: ["hackathon", "flagship"], applyUrl: "https://pennapps.com/",
+  },
+  {
+    id: "calhacks", title: "Cal Hacks", organization: "UC Berkeley",
+    type: "Hackathon", location: "Berkeley, CA", remote: false,
+    description: "UC Berkeley's flagship hackathon and one of the largest in the world, held each fall with major sponsor prizes and strong AI/startup energy.",
+    deadline: "2026-10-01", compensation: "Free to attend + prizes", eligibility: "All students",
+    tags: ["hackathon", "flagship"], applyUrl: "https://calhacks.io/",
+  },
+  {
+    id: "treehacks", title: "TreeHacks", organization: "Stanford University",
+    type: "Hackathon", location: "Stanford, CA", remote: false,
+    description: "Stanford's premier hackathon, held each February with tracks in health, sustainability, and AI. Admissions-based with travel grants; applications typically close in late fall.",
+    deadline: "2026-11-30", compensation: "Free to attend + travel grants + prizes", eligibility: "Undergraduates worldwide",
+    tags: ["hackathon", "flagship"], applyUrl: "https://www.treehacks.com/",
+  },
 ];
 
 /* ------------------------------ Small helpers ---------------------------- */
 const DAY = 24 * 3600 * 1000;
-const TYPES = ["Research", "Internship", "REU", "Lab Position"];
+const TYPES = ["Research", "Internship", "REU", "Lab Position", "Hackathon"];
 const STAGES = ["Interested", "Applied", "Interviewing", "Offer", "Rejected"];
 
 function slugify(s) {
@@ -268,7 +303,7 @@ const LLM_PROVIDER = import.meta.env.VITE_GEMINI_API_KEY
     : null;
 
 const JSON_SYSTEM =
-  'You are a data API for a student opportunity tracker. Respond with ONLY a valid JSON array. No markdown, no code fences, no preamble, no commentary — the first character of your reply must be "[" and the last must be "]". Each object must have exactly these keys: "id" (short slug string), "title", "organization", "type" (one of "Research", "Internship", "REU", "Lab Position"), "location", "remote" (boolean), "description" (2-3 sentences), "deadline" (ISO date string like "2026-10-15", or the exact string "Rolling"), "compensation", "eligibility", "tags" (array of lowercase strings), "applyUrl" (a real URL). Use web search to find real, currently open opportunities and their actual deadlines. If a deadline is unknown, use "Rolling". Keep descriptions concise so the full array fits in your reply.';
+  'You are a data API for a student opportunity tracker. Respond with ONLY a valid JSON array. No markdown, no code fences, no preamble, no commentary — the first character of your reply must be "[" and the last must be "]". Each object must have exactly these keys: "id" (short slug string), "title", "organization", "type" (one of "Research", "Internship", "REU", "Lab Position", "Hackathon"), "location", "remote" (boolean), "description" (2-3 sentences), "deadline" (ISO date string like "2026-10-15", or the exact string "Rolling"), "compensation", "eligibility", "tags" (array of lowercase strings), "applyUrl" (a real URL). Use web search to find real, currently open opportunities and their actual deadlines. If a deadline is unknown, use "Rolling". Keep descriptions concise so the full array fits in your reply.';
 
 const FETCH_CATEGORIES = [
   {
@@ -293,6 +328,14 @@ const FETCH_CATEGORIES = [
     fetcher: () =>
       fetchCategoryLLM(
         `Today is ${new Date().toDateString()}. Find 5-6 software engineering, machine learning, data science, or research engineering internships currently open (or opening soon) to undergraduates — a mix of structured early-career programs (e.g., Google STEP, Microsoft Explore) and general internships at tech companies, research labs, and startups. Return the JSON array only.`
+      ),
+  },
+  {
+    name: "hackathons",
+    kind: "llm",
+    fetcher: () =>
+      fetchCategoryLLM(
+        `Today is ${new Date().toDateString()}. Find 5-6 reputable collegiate hackathons open to undergraduates that are currently accepting registrations or have announced dates for the coming months — e.g., MLH member events and flagship hackathons like HackMIT, PennApps, Cal Hacks, TreeHacks, and TartanHacks (in-person or online). Set "type" to "Hackathon" and use the registration/application deadline as "deadline" (or "Rolling" if registration is open-ended). Return the JSON array only.`
       ),
   },
   { name: "internship feed", kind: "feed", fetcher: () => fetchInternshipsFeed() },
@@ -449,6 +492,7 @@ function TypeBadge({ type }) {
     Internship: { bg: "#EEF1F7", fg: "#3A5A8C" },
     REU: { bg: "#F6EFE6", fg: "#8A5A17" },
     "Lab Position": { bg: "#F2EEF6", fg: "#6B4A8E" },
+    Hackathon: { bg: "#F9ECF1", fg: "#8E3A5F" },
   }[type] || { bg: C.mist, fg: C.iron };
   return (
     <span className="text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap"
@@ -784,7 +828,7 @@ export default function CMUOpportunityHub() {
             <div className="w-8 h-8 rounded-sm flex items-center justify-center font-bold text-white" style={{ background: C.red, fontFamily: SERIF }}>C</div>
             <div>
               <div className="text-white font-semibold leading-tight" style={{ fontFamily: SERIF, fontSize: 17 }}>CS Opportunity Hub</div>
-              <div className="text-[11px] leading-tight" style={{ color: "#B9B5AE" }}>research · REUs · internships</div>
+              <div className="text-[11px] leading-tight" style={{ color: "#B9B5AE" }}>research · REUs · internships · hackathons</div>
             </div>
           </div>
           <div className="text-xs hidden sm:block" style={{ color: "#B9B5AE" }}>
@@ -855,7 +899,7 @@ export default function CMUOpportunityHub() {
           <div className="mt-3 px-4 py-3 rounded-lg text-sm"
             style={{ background: "#FFFDF5", border: `1px solid ${C.line}` }}>
             <span className="font-semibold" style={{ fontFamily: SERIF }}>Internship listings update live for free — no key needed. </span>
-            To also discover CMU research, REU, and AI-curated internship openings, add a free Gemini API key
+            To also discover CMU research, REU, hackathon, and AI-curated internship openings, add a free Gemini API key
             (no credit card) to <code>.env.local</code> — see the README.
           </div>
         )}
@@ -1491,7 +1535,7 @@ function DashboardView({ opportunities, userData, openModal }) {
     </div>
   );
 
-  const typeColors = ["#2E6B45", "#3A5A8C", "#8A5A17", "#6B4A8E"];
+  const typeColors = ["#2E6B45", "#3A5A8C", "#8A5A17", "#6B4A8E", "#8E3A5F"];
 
   return (
     <div className="flex flex-col gap-4">

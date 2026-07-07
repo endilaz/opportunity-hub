@@ -1,14 +1,16 @@
 # CMU CS Opportunity Hub
 
-A self-updating research & internship hub for CMU CS undergrads. Browse / Calendar /
+A self-updating research, internship & hackathon hub for CMU CS undergrads. Browse / Calendar /
 Tracker / Dashboard views, with live opportunity data from two free sources:
 
 - **Internships** — pulled straight from the public
   [SimplifyJobs internship list](https://github.com/SimplifyJobs/Summer2026-Internships)
   on GitHub. **No API key needed.**
-- **CMU research, REUs, and AI-curated internships** — discovered via the
-  **Google Gemini free tier** with Google Search grounding (free API key, no
-  credit card). An Anthropic key works as an optional paid fallback.
+- **CMU research, REUs, hackathons, and AI-curated internships** — discovered
+  via the **Google Gemini free tier** with Google Search grounding (free API
+  key, no credit card). An Anthropic key works as an optional paid fallback.
+  Reputable flagship hackathons (TartanHacks, HackMIT, PennApps, Cal Hacks,
+  TreeHacks) also ship in the seed data, so they're present even with no key.
 
 ## Run it locally
 
