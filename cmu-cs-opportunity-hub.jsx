@@ -6,7 +6,8 @@ import {
 /* ============================================================================
    CMU CS OPPORTUNITY HUB
    A self-updating research & internship hub for CMU CS undergrads.
-   - Live data via the Anthropic API (web search enabled), 3 parallel calls
+   - Live data: free SimplifyJobs internship feed (no key) + Gemini free tier
+     with Google Search grounding (Anthropic as optional paid fallback)
    - Persistent storage via window.storage (never localStorage)
    - Views: Browse / Calendar / Tracker / Dashboard
    ========================================================================== */
@@ -245,34 +246,160 @@ function csvEscape(v) {
 }
 
 /* --------------------------- Live fetch machinery ------------------------ */
+
+// Direct JSON feeds — no AI key needed. Add or swap URLs here; each must point
+// to a SimplifyJobs-style listings.json. Tried in order, first success wins,
+// so put the newest season first (a URL that 404s is skipped harmlessly).
+const INTERNSHIP_FEED_URLS = [
+  "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
+  "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+];
+const MAX_FEED_ITEMS = 30; // newest feed listings merged per refresh
+
+const GEMINI_MODEL = "gemini-2.5-flash";
+
+// Key precedence: free Gemini key first, Anthropic as optional paid fallback,
+// no key at all = feed-only refresh. Vite bakes env vars in at build time, so
+// a module-level const is safe.
+const LLM_PROVIDER = import.meta.env.VITE_GEMINI_API_KEY
+  ? { name: "gemini", key: import.meta.env.VITE_GEMINI_API_KEY }
+  : import.meta.env.VITE_ANTHROPIC_API_KEY
+    ? { name: "anthropic", key: import.meta.env.VITE_ANTHROPIC_API_KEY }
+    : null;
+
 const JSON_SYSTEM =
   'You are a data API for a student opportunity tracker. Respond with ONLY a valid JSON array. No markdown, no code fences, no preamble, no commentary — the first character of your reply must be "[" and the last must be "]". Each object must have exactly these keys: "id" (short slug string), "title", "organization", "type" (one of "Research", "Internship", "REU", "Lab Position"), "location", "remote" (boolean), "description" (2-3 sentences), "deadline" (ISO date string like "2026-10-15", or the exact string "Rolling"), "compensation", "eligibility", "tags" (array of lowercase strings), "applyUrl" (a real URL). Use web search to find real, currently open opportunities and their actual deadlines. If a deadline is unknown, use "Rolling". Keep descriptions concise so the full array fits in your reply.';
 
 const FETCH_CATEGORIES = [
   {
     name: "CMU research",
-    prompt: () =>
-      `Today is ${new Date().toDateString()}. Find 5-6 currently available Carnegie Mellon University undergraduate research openings and programs: SCS labs recruiting undergrad RAs, SURF, RISS, REUSE, and openings in the ML Department, Robotics Institute, HCII, LTI, or CyLab. Bias toward roles open to first- and second-year students. Return the JSON array only.`,
+    kind: "llm",
+    fetcher: () =>
+      fetchCategoryLLM(
+        `Today is ${new Date().toDateString()}. Find 5-6 currently available Carnegie Mellon University undergraduate research openings and programs: SCS labs recruiting undergrad RAs, SURF, RISS, REUSE, and openings in the ML Department, Robotics Institute, HCII, LTI, or CyLab. Bias toward roles open to first- and second-year students. Return the JSON array only.`
+      ),
   },
   {
     name: "external REUs",
-    prompt: () =>
-      `Today is ${new Date().toDateString()}. Find 5-6 external (non-CMU) undergraduate summer research programs and NSF REUs in computer science, machine learning, robotics, HCI, systems, or security that are currently accepting or will soon accept applications for the upcoming summer. Return the JSON array only.`,
+    kind: "llm",
+    fetcher: () =>
+      fetchCategoryLLM(
+        `Today is ${new Date().toDateString()}. Find 5-6 external (non-CMU) undergraduate summer research programs and NSF REUs in computer science, machine learning, robotics, HCI, systems, or security that are currently accepting or will soon accept applications for the upcoming summer. Return the JSON array only.`
+      ),
   },
   {
     name: "internships",
-    prompt: () =>
-      `Today is ${new Date().toDateString()}. Find 5-6 software engineering, machine learning, or research engineering internships currently open (or opening soon) to college freshmen, sophomores, or all undergraduates — e.g., programs like Google STEP, Microsoft Explore, and similar early-career tech internships. Return the JSON array only.`,
+    kind: "llm",
+    fetcher: () =>
+      fetchCategoryLLM(
+        `Today is ${new Date().toDateString()}. Find 5-6 software engineering, machine learning, data science, or research engineering internships currently open (or opening soon) to undergraduates — a mix of structured early-career programs (e.g., Google STEP, Microsoft Explore) and general internships at tech companies, research labs, and startups. Return the JSON array only.`
+      ),
   },
+  { name: "internship feed", kind: "feed", fetcher: () => fetchInternshipsFeed() },
 ];
 
-async function fetchCategory(prompt) {
-  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
-  if (!apiKey) {
+function parseJsonArrayResponse(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("[");
+  const end = clean.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) throw new Error("No JSON array in response");
+  const arr = JSON.parse(clean.slice(start, end + 1));
+  if (!Array.isArray(arr)) throw new Error("Response was not an array");
+  return arr.map(sanitizeItem).filter(Boolean);
+}
+
+// Map a SimplifyJobs listing to the raw shape sanitizeItem expects.
+function mapSimplifyListing(l) {
+  const locations = Array.isArray(l.locations) ? l.locations : [];
+  const terms = Array.isArray(l.terms) ? l.terms : [];
+  const posted = l.date_posted ? new Date(l.date_posted * 1000).toLocaleDateString() : null; // unix seconds
+  const bits = [`${l.title} at ${l.company_name}.`];
+  if (terms.length) bits.push(`Terms: ${terms.join(", ")}.`);
+  if (posted) bits.push(`Posted ${posted} on the SimplifyJobs internship list.`);
+  if (l.sponsorship && !/other/i.test(l.sponsorship)) bits.push(`Sponsorship: ${l.sponsorship}.`);
+  return {
+    id: "simplify-" + (l.id || slugify(l.title + "-" + l.company_name)),
+    title: l.title,
+    organization: l.company_name,
+    type: "Internship",
+    location: locations.join(" · "),
+    remote: locations.some((x) => /remote/i.test(x)),
+    description: bits.join(" "),
+    deadline: "Rolling",
+    compensation: "See listing",
+    eligibility: "Undergraduates",
+    tags: ["internship", ...terms],
+    applyUrl: l.url,
+  };
+}
+
+async function fetchInternshipsFeed() {
+  let lastErr = null;
+  for (const url of INTERNSHIP_FEED_URLS) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) { lastErr = new Error("Internship feed HTTP " + res.status); continue; }
+      const listings = await res.json();
+      if (!Array.isArray(listings)) { lastErr = new Error("Internship feed was not an array"); continue; }
+      return listings
+        .filter((l) => l && l.active && l.is_visible)
+        .sort((a, b) => (b.date_updated || b.date_posted || 0) - (a.date_updated || a.date_posted || 0))
+        .slice(0, MAX_FEED_ITEMS)
+        .map(mapSimplifyListing)
+        .map(sanitizeItem)
+        .filter(Boolean);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Internship feed unavailable");
+}
+
+async function fetchCategoryLLM(prompt) {
+  if (!LLM_PROVIDER) {
     throw new Error(
-      "Missing API key. Copy .env.example to .env.local, set VITE_ANTHROPIC_API_KEY, and restart the dev server."
+      "No AI key configured. Add a free VITE_GEMINI_API_KEY (aistudio.google.com/apikey) to .env.local and restart the dev server to enable live research/REU/internship discovery."
     );
   }
+  return LLM_PROVIDER.name === "gemini"
+    ? fetchCategoryGemini(prompt, LLM_PROVIDER.key)
+    : fetchCategoryAnthropic(prompt, LLM_PROVIDER.key);
+}
+
+async function fetchCategoryGemini(prompt, apiKey) {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: JSON_SYSTEM }] },
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        tools: [{ google_search: {} }],
+        // No responseMimeType: "application/json" — it's unreliable combined
+        // with the google_search tool, so JSON_SYSTEM + slice-parse enforce
+        // the format instead. Thinking tokens count toward the cap on 2.5
+        // models, hence the headroom.
+        generationConfig: { maxOutputTokens: 8192 },
+      }),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(
+      res.status === 429
+        ? "Gemini rate limit hit — wait a minute and retry."
+        : "Gemini API error " + res.status
+    );
+  }
+  const data = await res.json();
+  const cand = data.candidates && data.candidates[0];
+  const parts = (cand && cand.content && cand.content.parts) || [];
+  const text = parts.map((p) => p.text || "").join("\n");
+  if (!text.trim()) throw new Error("Empty Gemini response");
+  return parseJsonArrayResponse(text);
+}
+
+async function fetchCategoryAnthropic(prompt, apiKey) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -283,7 +410,7 @@ async function fetchCategory(prompt) {
     },
 
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
+      model: "claude-haiku-4-5",
       // 1000 tokens (the artifact-runtime cap) truncates a 5-6 item JSON array;
       // running locally with a real key we can give the response room to finish.
       max_tokens: 4000,
@@ -299,13 +426,7 @@ async function fetchCategory(prompt) {
     .filter((b) => b && b.type === "text")
     .map((b) => b.text || "")
     .join("\n");
-  const clean = text.replace(/```json|```/g, "").trim();
-  const start = clean.indexOf("[");
-  const end = clean.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) throw new Error("No JSON array in response");
-  const arr = JSON.parse(clean.slice(start, end + 1));
-  if (!Array.isArray(arr)) throw new Error("Response was not an array");
-  return arr.map(sanitizeItem).filter(Boolean);
+  return parseJsonArrayResponse(text);
 }
 
 /* ------------------------------ Storage keys ----------------------------- */
@@ -446,9 +567,11 @@ export default function CMUOpportunityHub() {
     setRefreshing(true);
     setFetchError(null);
     try {
-      const results = await Promise.allSettled(
-        FETCH_CATEGORIES.map((c) => fetchCategory(c.prompt()))
-      );
+      // Without an AI key, run only the keyless feed categories instead of failing.
+      const active = LLM_PROVIDER
+        ? FETCH_CATEGORIES
+        : FETCH_CATEGORIES.filter((c) => c.kind === "feed");
+      const results = await Promise.allSettled(active.map((c) => c.fetcher()));
       const fetched = [];
       let anyOk = false;
       results.forEach((r) => {
@@ -457,7 +580,7 @@ export default function CMUOpportunityHub() {
       });
       if (!anyOk) {
         const first = results.find((r) => r.status === "rejected");
-        throw new Error((first && first.reason && first.reason.message) || "All three category fetches failed");
+        throw new Error((first && first.reason && first.reason.message) || "All category fetches failed");
       }
 
       // Merge, never replace: keep existing entries so saves/notes/tracker survive.
@@ -476,8 +599,8 @@ export default function CMUOpportunityHub() {
       const failedCount = results.filter((r) => r.status === "rejected").length;
       setToast(
         additions.length > 0
-          ? `Found ${additions.length} new ${additions.length === 1 ? "opportunity" : "opportunities"}` + (failedCount ? ` (${failedCount} of 3 sources failed)` : "")
-          : "You're up to date — no new opportunities found" + (failedCount ? ` (${failedCount} of 3 sources failed)` : "")
+          ? `Found ${additions.length} new ${additions.length === 1 ? "opportunity" : "opportunities"}` + (failedCount ? ` (${failedCount} of ${results.length} sources failed)` : "")
+          : "You're up to date — no new opportunities found" + (failedCount ? ` (${failedCount} of ${results.length} sources failed)` : "")
       );
     } catch (e) {
       console.error(e);
@@ -726,6 +849,14 @@ export default function CMUOpportunityHub() {
               className="ml-auto px-3 py-1 rounded font-semibold text-white text-xs" style={{ background: C.red }}>
               Retry
             </button>
+          </div>
+        )}
+        {!LLM_PROVIDER && (
+          <div className="mt-3 px-4 py-3 rounded-lg text-sm"
+            style={{ background: "#FFFDF5", border: `1px solid ${C.line}` }}>
+            <span className="font-semibold" style={{ fontFamily: SERIF }}>Internship listings update live for free — no key needed. </span>
+            To also discover CMU research, REU, and AI-curated internship openings, add a free Gemini API key
+            (no credit card) to <code>.env.local</code> — see the README.
           </div>
         )}
         {!settings.introDismissed && (
