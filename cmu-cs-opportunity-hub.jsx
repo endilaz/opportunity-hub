@@ -8,7 +8,8 @@ import {
    A self-updating research, internship & hackathon hub for CMU CS undergrads.
    - Live data: free SimplifyJobs internship feed (no key) + Gemini free tier
      with Google Search grounding (Anthropic as optional paid fallback)
-   - Persistent storage via window.storage (never localStorage)
+   - Persistent storage via window.storage (never localStorage directly);
+     optional cross-device sync to a private GitHub Gist — see src/storage-shim.js
    - Views: Browse / Calendar / Tracker / Dashboard
    ========================================================================== */
 
@@ -485,6 +486,30 @@ async function storageLoad(key) {
   return null;
 }
 
+function normalizeUserRecord(user) {
+  return {
+    saved: user.saved || [], notes: user.notes || {}, tracker: user.tracker || {},
+    hidden: user.hidden || [], overrides: user.overrides || {},
+  };
+}
+function parseCacheRecord(cache) {
+  let list = SEED_OPPORTUNITIES;
+  let updated = null;
+  if (cache && Array.isArray(cache.list) && cache.list.length > 0) {
+    const cleaned = cache.list
+      .map((raw) => {
+        const clean = sanitizeItem(raw);
+        return clean ? { ...clean, fetchedAt: raw && raw.fetchedAt } : null;
+      })
+      .filter(Boolean);
+    if (cleaned.length > 0) {
+      list = cleaned;
+      updated = cache.lastUpdated || null;
+    }
+  }
+  return { list, updated };
+}
+
 /* ============================== UI primitives ============================= */
 function TypeBadge({ type }) {
   const colors = {
@@ -557,6 +582,98 @@ function Spinner({ size = 14 }) {
   return (
     <span className="inline-block animate-spin rounded-full border-2 border-t-transparent align-middle"
       style={{ width: size, height: size, borderColor: "#fff", borderTopColor: "transparent" }} />
+  );
+}
+
+/* ----------------------------- Sync settings ----------------------------- */
+// Lives inside the dark settings dropdown. Talks to window.storage.sync
+// (see src/storage-shim.js); renders nothing where sync isn't available
+// (e.g. the artifact runtime, which brings its own window.storage).
+function SyncPanel() {
+  const sync = window.storage && window.storage.sync;
+  const [status, setStatus] = useState(() => (sync ? sync.getStatus() : null));
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!sync) return;
+    const onStatus = (e) => setStatus(e.detail);
+    window.addEventListener("hub-sync-status", onStatus);
+    return () => window.removeEventListener("hub-sync-status", onStatus);
+  }, [sync]);
+
+  if (!sync || !status) return null;
+
+  const connect = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await sync.configure(token);
+      setToken("");
+    } catch (e) {
+      setError((e && e.message) || "Could not connect.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const linkStyle = { color: "#E8B4BE", textDecoration: "underline" };
+
+  return (
+    <div className="w-full pt-3 border-t" style={{ borderColor: "#4A4844" }}>
+      {!status.enabled ? (
+        <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: "#B9B5AE" }}>
+          <span className="font-semibold text-sm text-white">Sync across devices:</span>
+          <span>
+            paste a{" "}
+            <a href="https://github.com/settings/tokens/new?scopes=gist&description=Opportunity%20Hub%20sync"
+              target="_blank" rel="noopener noreferrer" style={linkStyle}>
+              GitHub token ("gist" scope only)
+            </a>{" "}
+            and your data lives in a private gist instead of only this browser.
+          </span>
+          <input type="password" value={token} onChange={(e) => setToken(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && token.trim() && !busy) connect(); }}
+            placeholder="ghp_…" autoComplete="off"
+            className="px-2 py-1 rounded text-xs outline-none min-w-[220px]"
+            style={{ background: "#1E1D1B", border: "1px solid #4A4844", color: "#fff" }} />
+          <button onClick={connect} disabled={busy || !token.trim()}
+            className="px-2.5 py-1 rounded text-xs font-semibold text-white disabled:opacity-60 flex items-center gap-1.5"
+            style={{ background: C.red }}>
+            {busy && <Spinner size={11} />}{busy ? "Connecting…" : "Connect"}
+          </button>
+          {error && <span className="w-full" style={{ color: "#F3A6B2" }}>{error}</span>}
+          <span className="w-full" style={{ color: "#8B8781" }}>
+            If sync data already exists on your account, this device adopts it. The token stays on this device.
+          </span>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center gap-3 text-xs" style={{ color: "#B9B5AE" }}>
+          <span className="font-semibold text-sm text-white">Sync</span>
+          <span>
+            {status.syncing ? "Syncing…"
+              : status.error ? "Sync error: " + status.error
+              : status.lastSyncAt ? "Synced " + timeAgo(status.lastSyncAt)
+              : "Waiting for first sync…"}
+            {status.account ? " · @" + status.account : ""}
+          </span>
+          {status.gistUrl && (
+            <a href={status.gistUrl} target="_blank" rel="noopener noreferrer" style={linkStyle}>view data ↗</a>
+          )}
+          <div className="ml-auto flex gap-2">
+            <button onClick={() => sync.syncNow()} disabled={status.syncing}
+              className="px-2 py-1 rounded text-xs font-semibold text-white disabled:opacity-60" style={{ background: "#4A4844" }}>
+              Sync now
+            </button>
+            <button onClick={() => sync.disconnect()}
+              className="px-2 py-1 rounded text-xs font-semibold text-white" style={{ background: "#4A4844" }}>
+              Disconnect
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -675,30 +792,17 @@ export default function CMUOpportunityHub() {
   /* ------------------------------ initial boot ---------------------------- */
   useEffect(() => {
     (async () => {
+      // If cloud sync is configured, let the initial pull land first so we
+      // boot from the freshest copy (resolves immediately when sync is off).
+      try { await window.storage.ready; } catch (e) { /* offline — boot from local */ }
       const [cache, user, setts] = await Promise.all([
         storageLoad(KEY_CACHE), storageLoad(KEY_USER), storageLoad(KEY_SETTINGS),
       ]);
-      if (user && typeof user === "object") {
-        setUserData({
-          saved: user.saved || [], notes: user.notes || {}, tracker: user.tracker || {},
-          hidden: user.hidden || [], overrides: user.overrides || {},
-        });
-      }
+      if (user && typeof user === "object") setUserData(normalizeUserRecord(user));
       if (setts && typeof setts === "object") {
         setSettings({ autoRefresh: !!setts.autoRefresh, introDismissed: !!setts.introDismissed });
       }
-      let list = SEED_OPPORTUNITIES;
-      let updated = null;
-      if (cache && Array.isArray(cache.list) && cache.list.length > 0) {
-        list = cache.list
-          .map((raw) => {
-            const clean = sanitizeItem(raw);
-            return clean ? { ...clean, fetchedAt: raw && raw.fetchedAt } : null;
-          })
-          .filter(Boolean);
-        if (list.length === 0) list = SEED_OPPORTUNITIES;
-        else updated = cache.lastUpdated || null;
-      }
+      const { list, updated } = parseCacheRecord(cache);
       setOpportunities(list);
       setLastUpdated(updated);
       setBooted(true);
@@ -709,6 +813,34 @@ export default function CMUOpportunityHub() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /* --------------------- apply sync pulls from other devices --------------------- */
+  useEffect(() => {
+    if (!booted) return;
+    const onRemoteChange = async (e) => {
+      const keys = (e.detail && e.detail.keys) || [];
+      if (keys.includes(KEY_USER)) {
+        const user = await storageLoad(KEY_USER);
+        if (user && typeof user === "object") setUserData(normalizeUserRecord(user));
+      }
+      if (keys.includes(KEY_SETTINGS)) {
+        const setts = await storageLoad(KEY_SETTINGS);
+        if (setts && typeof setts === "object") {
+          setSettings({ autoRefresh: !!setts.autoRefresh, introDismissed: !!setts.introDismissed });
+        }
+      }
+      if (keys.includes(KEY_CACHE)) {
+        const { list, updated } = parseCacheRecord(await storageLoad(KEY_CACHE));
+        setOpportunities(list);
+        setLastUpdated(updated);
+      }
+      if (keys.some((k) => [KEY_USER, KEY_SETTINGS, KEY_CACHE].includes(k))) {
+        setToast("Synced updates from your other devices");
+      }
+    };
+    window.addEventListener("hub-sync-remote-change", onRemoteChange);
+    return () => window.removeEventListener("hub-sync-remote-change", onRemoteChange);
+  }, [booted]);
 
   /* ---------------------------- auto-refresh loop -------------------------- */
   useEffect(() => {
@@ -900,6 +1032,7 @@ export default function CMUOpportunityHub() {
                 <button onClick={exportJSON} className="px-2 py-1 rounded text-xs font-semibold" style={{ background: "#4A4844" }}>Export JSON</button>
                 <button onClick={exportCSV} className="px-2 py-1 rounded text-xs font-semibold" style={{ background: "#4A4844" }}>Export CSV</button>
               </div>
+              <SyncPanel />
             </div>
           </div>
         )}

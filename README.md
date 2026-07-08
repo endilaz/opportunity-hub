@@ -28,6 +28,25 @@ cp .env.example .env.local   # then paste a free Gemini key from aistudio.google
 
 and restart the dev server.
 
+## Sync across devices
+
+By default everything lives in this browser's localStorage. To make your saves,
+notes, tracker, and opportunity list follow you anywhere:
+
+1. Create a GitHub **classic** token with **only the `gist` scope**
+   ([direct link](https://github.com/settings/tokens/new?scopes=gist&description=Opportunity%20Hub%20sync)).
+   Fine-grained tokens don't cover the Gist API — use a classic one.
+2. In the app, open **⚙ settings → Sync across devices** and paste the token.
+
+The app stores all data in a single **secret gist** on your account and keeps
+localStorage as an offline cache. Paste the same token on any other
+browser/device and it attaches to the same gist — when sync data already
+exists, a newly connected device adopts the cloud copy, and after that merges
+are newest-wins per record. The app pulls at startup, on window focus, and
+every 5 minutes, and pushes a couple of seconds after you change anything.
+The token itself never syncs; it stays on each device. **Disconnect** stops
+syncing but keeps both the local data and the gist.
+
 ## Notes
 
 - **Key precedence**: `VITE_GEMINI_API_KEY` (free) → `VITE_ANTHROPIC_API_KEY`
@@ -40,8 +59,10 @@ and restart the dev server.
   first that responds wins, so add the new season's SimplifyJobs
   `listings.json` URL at the top each recruiting cycle (a URL that 404s is
   skipped harmlessly). Any SimplifyJobs-style `listings.json` URL works.
-- **Persistence** is localStorage-backed via `src/storage-shim.js`, which emulates
-  the artifact runtime's `window.storage` API. Saves, notes, tracker state, and
-  the opportunity cache all survive reloads.
+- **Persistence** goes through `src/storage-shim.js`, which emulates the
+  artifact runtime's `window.storage` API on top of localStorage and adds the
+  optional GitHub Gist sync described above. Saves, notes, tracker state, and
+  the opportunity cache all survive reloads (and follow you across devices
+  once sync is connected).
 - **Seed data** lives in `SEED_OPPORTUNITIES` at the top of
   `cmu-cs-opportunity-hub.jsx` — edit freely.
