@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell,
 } from "recharts";
+import { dedupeOpportunityList, mergeUniqueOpportunities } from "./src/opportunity-utils.js";
 
 /* ============================================================================
    CMU CS OPPORTUNITY HUB
@@ -496,12 +497,14 @@ function parseCacheRecord(cache) {
   let list = SEED_OPPORTUNITIES;
   let updated = null;
   if (cache && Array.isArray(cache.list) && cache.list.length > 0) {
-    const cleaned = cache.list
-      .map((raw) => {
-        const clean = sanitizeItem(raw);
-        return clean ? { ...clean, fetchedAt: raw && raw.fetchedAt } : null;
-      })
-      .filter(Boolean);
+    const cleaned = dedupeOpportunityList(
+      cache.list
+        .map((raw) => {
+          const clean = sanitizeItem(raw);
+          return clean ? { ...clean, fetchedAt: raw && raw.fetchedAt } : null;
+        })
+        .filter(Boolean)
+    );
     if (cleaned.length > 0) {
       list = cleaned;
       updated = cache.lastUpdated || null;
@@ -757,16 +760,9 @@ export default function CMUOpportunityHub() {
 
       // Merge, never replace: keep existing entries so saves/notes/tracker survive.
       const current = oppsRef.current;
-      const seen = new Set(current.map(normKey));
       const nowTs = Date.now();
-      const additions = [];
-      for (const item of fetched) {
-        const k = normKey(item);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        additions.push({ ...item, fetchedAt: nowTs });
-      }
-      setOpportunities([...current, ...additions]);
+      const { merged, additions } = mergeUniqueOpportunities(current, fetched, nowTs);
+      setOpportunities(merged);
       setLastUpdated(nowTs);
       const failedCount = results.filter((r) => r.status === "rejected").length;
       setToast(
