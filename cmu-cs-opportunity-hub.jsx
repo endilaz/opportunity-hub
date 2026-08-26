@@ -2,13 +2,15 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell,
 } from "recharts";
-import { dedupeOpportunityList, mergeUniqueOpportunities } from "./src/opportunity-utils.js";
+import { dedupeOpportunityList, mergeUniqueOpportunities, slugify } from "./src/opportunity-utils.js";
+import { feedCandidateUrls, feedLabel, parseFeedText } from "./src/feed-sources.js";
 
 /* ============================================================================
    CMU CS OPPORTUNITY HUB
    A self-updating research, internship & hackathon hub for CMU CS undergrads.
-   - Live data: free SimplifyJobs internship feed (no key) + Gemini free tier
-     with Google Search grounding (Anthropic as optional paid fallback)
+   - Live data: free job-board feeds (no key) — the built-in SimplifyJobs list
+     plus any boards the user adds in ⚙ settings — and, with a key, Gemini free
+     tier with Google Search grounding (Anthropic as optional paid fallback)
    - Persistent storage via window.storage (never localStorage directly);
      optional cross-device sync to a private GitHub Gist — see src/storage-shim.js
    - Views: Browse / Calendar / Tracker / Dashboard
@@ -184,9 +186,6 @@ const DAY = 24 * 3600 * 1000;
 const TYPES = ["Research", "Internship", "REU", "Lab Position", "Hackathon"];
 const STAGES = ["Interested", "Applied", "Interviewing", "Offer", "Rejected"];
 
-function slugify(s) {
-  return String(s).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
-}
 function normKey(o) {
   return (String(o.title || "").toLowerCase().trim() + "::" + String(o.organization || "").toLowerCase().trim());
 }
@@ -219,6 +218,9 @@ function sanitizeItem(raw) {
     eligibility: raw.eligibility ? String(raw.eligibility) : "Undergraduates",
     tags,
     applyUrl: raw.applyUrl && typeof raw.applyUrl === "string" ? raw.applyUrl : "",
+    // Kept when a board reports it — this is what the deadline estimate below
+    // is derived from. Null for anything that never had a post date.
+    postedAt: typeof raw.postedAt === "number" && raw.postedAt > 0 ? raw.postedAt : null,
   };
 }
 function daysUntil(iso) {
@@ -232,6 +234,31 @@ function fmtDeadline(iso) {
   const d = new Date(iso + "T00:00:00");
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
+
+/* --------------------------- Deadline estimation -------------------------- */
+// Job boards publish a post date, not a deadline, so every feed listing would
+// otherwise sit in the pile of "Rolling" entries that sort last and never reach
+// the calendar. We estimate one two weeks after the post date — but only where a
+// real post date exists, only while that estimate is still in the future (a
+// months-old posting gets no invented "passed" date), never on top of a listing
+// the user edited, and always marked so it reads as a guess, not a fact.
+const ESTIMATE_WINDOW_DAYS = 14;
+const ESTIMATE_TOOLTIP =
+  "Estimated deadline — about two weeks after this listing was posted. Not from the employer; confirm on the application page.";
+
+function toLocalIso(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function withEstimatedDeadline(o, enabled, edited) {
+  if (!enabled || edited) return o;
+  if (o.deadline !== "Rolling") return o;
+  if (typeof o.postedAt !== "number" || !o.postedAt) return o;
+  const est = o.postedAt + ESTIMATE_WINDOW_DAYS * DAY;
+  if (est <= Date.now()) return o; // stale posting — leave it Rolling
+  return { ...o, deadline: toLocalIso(est), deadlineEstimated: true };
+}
+
 function timeAgo(ts) {
   if (!ts) return "never";
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -284,14 +311,14 @@ function csvEscape(v) {
 
 /* --------------------------- Live fetch machinery ------------------------ */
 
-// Direct JSON feeds — no AI key needed. Add or swap URLs here; each must point
-// to a SimplifyJobs-style listings.json. Tried in order, first success wins,
-// so put the newest season first (a URL that 404s is skipped harmlessly).
-const INTERNSHIP_FEED_URLS = [
+// Built-in boards — no AI key needed. Tried in order, first success wins, so the
+// newest season goes first (a URL that 404s is skipped harmlessly). Boards the
+// user adds live in settings.feeds and are fetched alongside these, one source
+// each — see buildFetchCategories below and src/feed-sources.js for parsing.
+const BUILTIN_FEED_URLS = [
   "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
   "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
 ];
-const MAX_FEED_ITEMS = 30; // newest feed listings merged per refresh
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 
@@ -307,7 +334,7 @@ const LLM_PROVIDER = import.meta.env.VITE_GEMINI_API_KEY
 const JSON_SYSTEM =
   'You are a data API for a student opportunity tracker. Respond with ONLY a valid JSON array. No markdown, no code fences, no preamble, no commentary — the first character of your reply must be "[" and the last must be "]". Each object must have exactly these keys: "id" (short slug string), "title", "organization", "type" (one of "Research", "Internship", "REU", "Lab Position", "Hackathon"), "location", "remote" (boolean), "description" (2-3 sentences), "deadline" (ISO date string like "2026-10-15", or the exact string "Rolling"), "compensation", "eligibility", "tags" (array of lowercase strings), "applyUrl" (a real URL). Use web search to find real, currently open opportunities and their actual deadlines. If a deadline is unknown, use "Rolling". Keep descriptions concise so the full array fits in your reply.';
 
-const FETCH_CATEGORIES = [
+const LLM_CATEGORIES = [
   {
     name: "CMU research",
     kind: "llm",
@@ -340,7 +367,6 @@ const FETCH_CATEGORIES = [
         `Today is ${new Date().toDateString()}. Find 5-6 reputable collegiate hackathons open to undergraduates that are currently accepting registrations or have announced dates for the coming months — e.g., MLH member events and flagship hackathons like HackMIT, PennApps, Cal Hacks, TreeHacks, and TartanHacks (in-person or online). Set "type" to "Hackathon" and use the registration/application deadline as "deadline" (or "Rolling" if registration is open-ended). Return the JSON array only.`
       ),
   },
-  { name: "internship feed", kind: "feed", fetcher: () => fetchInternshipsFeed() },
 ];
 
 function parseJsonArrayResponse(text) {
@@ -353,51 +379,54 @@ function parseJsonArrayResponse(text) {
   return arr.map(sanitizeItem).filter(Boolean);
 }
 
-// Map a SimplifyJobs listing to the raw shape sanitizeItem expects.
-function mapSimplifyListing(l) {
-  const locations = Array.isArray(l.locations) ? l.locations : [];
-  const terms = Array.isArray(l.terms) ? l.terms : [];
-  const posted = l.date_posted ? new Date(l.date_posted * 1000).toLocaleDateString() : null; // unix seconds
-  const bits = [`${l.title} at ${l.company_name}.`];
-  if (terms.length) bits.push(`Terms: ${terms.join(", ")}.`);
-  if (posted) bits.push(`Posted ${posted} on the SimplifyJobs internship list.`);
-  if (l.sponsorship && !/other/i.test(l.sponsorship)) bits.push(`Sponsorship: ${l.sponsorship}.`);
-  return {
-    id: "simplify-" + (l.id || slugify(l.title + "-" + l.company_name)),
-    title: l.title,
-    organization: l.company_name,
-    type: "Internship",
-    location: locations.join(" · "),
-    remote: locations.some((x) => /remote/i.test(x)),
-    description: bits.join(" "),
-    deadline: "Rolling",
-    compensation: "See listing",
-    eligibility: "Undergraduates",
-    tags: ["internship", ...terms],
-    applyUrl: l.url,
-  };
-}
-
-async function fetchInternshipsFeed() {
+// Fetch one job board. `input` is whatever was pasted (a GitHub repo URL, a raw
+// listings.json, a raw README.md); `preferred` is the URL that worked last time,
+// so a resolved repo doesn't re-walk its candidate branches on every refresh.
+async function fetchFeedUrl(input, preferred) {
+  const candidates = [];
+  for (const u of [preferred, ...feedCandidateUrls(input)]) {
+    if (u && !candidates.includes(u)) candidates.push(u);
+  }
   let lastErr = null;
-  for (const url of INTERNSHIP_FEED_URLS) {
+  for (const url of candidates) {
     try {
       const res = await fetch(url);
-      if (!res.ok) { lastErr = new Error("Internship feed HTTP " + res.status); continue; }
-      const listings = await res.json();
-      if (!Array.isArray(listings)) { lastErr = new Error("Internship feed was not an array"); continue; }
-      return listings
-        .filter((l) => l && l.active && l.is_visible)
-        .sort((a, b) => (b.date_updated || b.date_posted || 0) - (a.date_updated || a.date_posted || 0))
-        .slice(0, MAX_FEED_ITEMS)
-        .map(mapSimplifyListing)
-        .map(sanitizeItem)
-        .filter(Boolean);
+      if (!res.ok) { lastErr = new Error("HTTP " + res.status + " from " + url); continue; }
+      const items = parseFeedText(await res.text(), url).map(sanitizeItem).filter(Boolean);
+      if (items.length) return { items, resolvedUrl: url };
+      lastErr = new Error("No listings found at " + url + " — expected a listings.json or a markdown table of roles.");
     } catch (e) {
-      lastErr = e;
+      // A blocked cross-origin request surfaces as an opaque TypeError.
+      lastErr = e instanceof TypeError
+        ? new Error("Could not fetch " + url + " — that site may block browser requests (CORS).")
+        : e;
     }
   }
+  throw lastErr || new Error("Feed unavailable");
+}
+
+// The built-in boards are a single source: the first season that responds wins.
+async function fetchBuiltinFeed() {
+  let lastErr = null;
+  for (const url of BUILTIN_FEED_URLS) {
+    try { return (await fetchFeedUrl(url)).items; } catch (e) { lastErr = e; }
+  }
   throw lastErr || new Error("Internship feed unavailable");
+}
+
+// LLM categories only run with a key. Each custom board is its own source, so a
+// board that breaks costs you that board and not the rest of the refresh.
+function buildFetchCategories(customFeeds) {
+  const categories = LLM_PROVIDER ? [...LLM_CATEGORIES] : [];
+  categories.push({ name: "internship feed", kind: "feed", fetcher: () => fetchBuiltinFeed() });
+  (customFeeds || [])
+    .filter((f) => f && f.url && f.enabled !== false)
+    .forEach((f) => categories.push({
+      name: f.label || feedLabel(f.url),
+      kind: "feed",
+      fetcher: () => fetchFeedUrl(f.url, f.resolvedUrl).then((r) => r.items),
+    }));
+  return categories;
 }
 
 async function fetchCategoryLLM(prompt) {
@@ -477,7 +506,7 @@ async function fetchCategoryAnthropic(prompt, apiKey) {
 /* ------------------------------ Storage keys ----------------------------- */
 const KEY_CACHE = "cmu-opps-cache";      // { list, lastUpdated }
 const KEY_USER = "cmu-opps-user-data";   // { saved, notes, tracker, hidden, overrides }
-const KEY_SETTINGS = "cmu-opps-settings";// { autoRefresh, introDismissed }
+const KEY_SETTINGS = "cmu-opps-settings";// { autoRefresh, introDismissed, estimateDeadlines, feeds }
 
 async function storageLoad(key) {
   try {
@@ -485,6 +514,29 @@ async function storageLoad(key) {
     if (r && r.value) return JSON.parse(r.value);
   } catch (e) { /* key missing or parse error — fall through */ }
   return null;
+}
+
+const DEFAULT_SETTINGS = { autoRefresh: false, introDismissed: false, estimateDeadlines: true, feeds: [] };
+
+function normalizeSettings(raw) {
+  const s = raw && typeof raw === "object" ? raw : {};
+  return {
+    autoRefresh: !!s.autoRefresh,
+    introDismissed: !!s.introDismissed,
+    // Saves written before the estimate existed have no flag — default it on.
+    estimateDeadlines: s.estimateDeadlines === undefined ? true : !!s.estimateDeadlines,
+    feeds: Array.isArray(s.feeds)
+      ? s.feeds
+          .filter((f) => f && typeof f.url === "string" && f.url.trim())
+          .map((f) => ({
+            id: String(f.id || f.url),
+            url: f.url.trim(),
+            label: String(f.label || feedLabel(f.url)),
+            resolvedUrl: typeof f.resolvedUrl === "string" ? f.resolvedUrl : null,
+            enabled: f.enabled !== false,
+          }))
+      : [],
+  };
 }
 
 function normalizeUserRecord(user) {
@@ -530,15 +582,16 @@ function TypeBadge({ type }) {
   );
 }
 
-function DeadlinePill({ deadline }) {
+function DeadlinePill({ deadline, estimated }) {
   const d = daysUntil(deadline);
   let bg = C.mist, fg = C.iron, label = fmtDeadline(deadline);
   if (deadline === "Rolling") { bg = "#E9EFF5"; fg = C.rolling; label = "Rolling"; }
   else if (d != null && d < 0) { bg = "#F0EEEA"; fg = C.faint; label = "Passed · " + fmtDeadline(deadline); }
   else if (d != null && d <= 14) { bg = "#FBE9EC"; fg = C.red; label = (d === 0 ? "Due today" : "Due in " + d + "d") + " · " + fmtDeadline(deadline); }
   return (
-    <span className="text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap" style={{ background: bg, color: fg }}>
-      {label}
+    <span className="text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap"
+      style={{ background: bg, color: fg }} title={estimated ? ESTIMATE_TOOLTIP : undefined}>
+      {estimated ? "~" : ""}{label}
     </span>
   );
 }
@@ -680,6 +733,84 @@ function SyncPanel() {
   );
 }
 
+/* ---------------------------- Job board feeds ---------------------------- */
+// Also lives in the dark settings dropdown. A board is validated by actually
+// fetching and parsing it before it joins the list, so a URL that can't be read
+// fails here with a reason instead of silently contributing nothing at refresh.
+function FeedsPanel({ feeds, setFeeds }) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const add = async () => {
+    const raw = url.trim();
+    if (!raw) return;
+    if (!/^https?:\/\//i.test(raw)) { setError("Paste a full URL starting with https://"); return; }
+    if (feeds.some((f) => f.url.toLowerCase() === raw.toLowerCase())) { setError("That board is already on the list."); return; }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const { items, resolvedUrl } = await fetchFeedUrl(raw);
+      setFeeds([...feeds, { id: "feed-" + Date.now(), url: raw, label: feedLabel(raw), resolvedUrl, enabled: true }]);
+      setUrl("");
+      setNotice(`Added ${feedLabel(raw)} — ${items.length} listing${items.length === 1 ? "" : "s"} found. Hit "Refresh opportunities" to pull them in.`);
+    } catch (e) {
+      setError((e && e.message) || "Could not read that board.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const update = (id, patch) => setFeeds(feeds.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  const remove = (id) => setFeeds(feeds.filter((f) => f.id !== id));
+  const rowStyle = { background: "#1E1D1B", border: "1px solid #4A4844" };
+
+  return (
+    <div className="w-full pt-3 border-t" style={{ borderColor: "#4A4844" }}>
+      <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: "#B9B5AE" }}>
+        <span className="font-semibold text-sm text-white">Job board feeds:</span>
+        <span>
+          paste a GitHub repo — or a raw <code>listings.json</code> / <code>README.md</code> URL — and it gets
+          scraped on every refresh alongside the built-in board.
+        </span>
+      </div>
+
+      <div className="mt-2 flex flex-col gap-1.5">
+        <div className="flex items-center gap-2 px-2 py-1.5 rounded text-xs" style={rowStyle}>
+          <span className="font-semibold text-white">SimplifyJobs</span>
+          <span style={{ color: "#8B8781" }}>built in · Summer 2027, falling back to Summer 2026</span>
+        </div>
+        {feeds.map((f) => (
+          <div key={f.id} className="flex items-center gap-2 px-2 py-1.5 rounded text-xs" style={rowStyle}>
+            <input type="checkbox" checked={f.enabled !== false}
+              onChange={(e) => update(f.id, { enabled: e.target.checked })}
+              title={f.enabled === false ? "Include this board on refresh" : "Skip this board on refresh"} />
+            <span className="font-semibold text-white whitespace-nowrap">{f.label}</span>
+            <span className="flex-1 min-w-0 truncate" style={{ color: "#8B8781" }} title={f.url}>{f.url}</span>
+            <button onClick={() => remove(f.id)} aria-label={"Remove " + f.label}
+              className="font-bold hover:opacity-60" style={{ color: "#F3A6B2" }}>×</button>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        <input value={url} onChange={(e) => { setUrl(e.target.value); setError(null); setNotice(null); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && url.trim() && !busy) add(); }}
+          placeholder="https://github.com/owner/repo" autoComplete="off"
+          className="flex-1 min-w-[240px] px-2 py-1 rounded text-xs outline-none"
+          style={{ background: "#1E1D1B", border: "1px solid #4A4844", color: "#fff" }} />
+        <button onClick={add} disabled={busy || !url.trim()}
+          className="px-2.5 py-1 rounded text-xs font-semibold text-white disabled:opacity-60 flex items-center gap-1.5"
+          style={{ background: C.red }}>
+          {busy && <Spinner size={11} />}{busy ? "Checking…" : "Add board"}
+        </button>
+        {error && <span className="w-full" style={{ color: "#F3A6B2" }}>{error}</span>}
+        {notice && <span className="w-full" style={{ color: "#A8CDB4" }}>{notice}</span>}
+      </div>
+    </div>
+  );
+}
+
 /* ================================== APP =================================== */
 export default function CMUOpportunityHub() {
   const [opportunities, setOpportunities] = useState([]);
@@ -690,10 +821,11 @@ export default function CMUOpportunityHub() {
   const [toast, setToast] = useState(null);
 
   const [userData, setUserData] = useState({ saved: [], notes: {}, tracker: {}, hidden: [], overrides: {} });
-  const [settings, setSettings] = useState({ autoRefresh: false, introDismissed: false });
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
 
   const [view, setView] = useState("browse");
   const [modalId, setModalId] = useState(null);
+  const [modalIds, setModalIds] = useState([]); // the list the modal's arrows walk
   const [showSettings, setShowSettings] = useState(false);
 
   // Browse controls
@@ -712,6 +844,8 @@ export default function CMUOpportunityHub() {
   const saveTimers = useRef({});
   const oppsRef = useRef(opportunities);
   oppsRef.current = opportunities;
+  const feedsRef = useRef(settings.feeds);
+  feedsRef.current = settings.feeds;
   const refreshRef = useRef(null);
 
   /* ------------------------- debounced persistence ------------------------ */
@@ -742,16 +876,14 @@ export default function CMUOpportunityHub() {
     setRefreshing(true);
     setFetchError(null);
     try {
-      // Without an AI key, run only the keyless feed categories instead of failing.
-      const active = LLM_PROVIDER
-        ? FETCH_CATEGORIES
-        : FETCH_CATEGORIES.filter((c) => c.kind === "feed");
+      // Keyless runs get the boards only; the user's own boards are always in.
+      const active = buildFetchCategories(feedsRef.current);
       const results = await Promise.allSettled(active.map((c) => c.fetcher()));
       const fetched = [];
       let anyOk = false;
-      results.forEach((r) => {
+      results.forEach((r, i) => {
         if (r.status === "fulfilled") { anyOk = true; fetched.push(...r.value); }
-        else console.error("Category fetch failed:", r.reason);
+        else console.error(`Source failed (${active[i].name}):`, r.reason);
       });
       if (!anyOk) {
         const first = results.find((r) => r.status === "rejected");
@@ -796,7 +928,7 @@ export default function CMUOpportunityHub() {
       ]);
       if (user && typeof user === "object") setUserData(normalizeUserRecord(user));
       if (setts && typeof setts === "object") {
-        setSettings({ autoRefresh: !!setts.autoRefresh, introDismissed: !!setts.introDismissed });
+        setSettings(normalizeSettings(setts));
       }
       const { list, updated } = parseCacheRecord(cache);
       setOpportunities(list);
@@ -822,7 +954,7 @@ export default function CMUOpportunityHub() {
       if (keys.includes(KEY_SETTINGS)) {
         const setts = await storageLoad(KEY_SETTINGS);
         if (setts && typeof setts === "object") {
-          setSettings({ autoRefresh: !!setts.autoRefresh, introDismissed: !!setts.introDismissed });
+          setSettings(normalizeSettings(setts));
         }
       }
       if (keys.includes(KEY_CACHE)) {
@@ -849,8 +981,12 @@ export default function CMUOpportunityHub() {
   // User edits layer on top of fetched data, so they survive feed refreshes.
   const displayed = useMemo(() => {
     const ov = userData.overrides || {};
-    return opportunities.map((o) => (ov[o.id] ? { ...o, ...ov[o.id], id: o.id } : o));
-  }, [opportunities, userData.overrides]);
+    return opportunities.map((o) => {
+      const edited = !!ov[o.id];
+      const base = edited ? { ...o, ...ov[o.id], id: o.id, postedAt: o.postedAt } : o;
+      return withEstimatedDeadline(base, settings.estimateDeadlines, edited);
+    });
+  }, [opportunities, userData.overrides, settings.estimateDeadlines]);
 
   const hiddenSet = useMemo(() => new Set(userData.hidden), [userData.hidden]);
   const visible = useMemo(() => displayed.filter((o) => !hiddenSet.has(o.id)), [displayed, hiddenSet]);
@@ -899,8 +1035,14 @@ export default function CMUOpportunityHub() {
     return [...list].sort(sorters[sortBy] || sorters.deadline);
   }, [displayed, hiddenSet, filters, search, sortBy, userData.saved]);
 
+  // Estimates stay out of the alarm banner — a guessed date shouldn't shout.
+  // They still sort, filter, and land on the calendar like any other deadline.
   const dueSoon = useMemo(() =>
-    visible.filter((o) => { const d = daysUntil(o.deadline); return d != null && d >= 0 && d <= 3; })
+    visible.filter((o) => {
+      if (o.deadlineEstimated) return false;
+      const d = daysUntil(o.deadline);
+      return d != null && d >= 0 && d <= 3;
+    })
       .sort((a, b) => daysUntil(a.deadline) - daysUntil(b.deadline)),
     [visible]);
 
@@ -935,7 +1077,10 @@ export default function CMUOpportunityHub() {
         ...u.tracker,
         [opp.id]: {
           status: "Interested", dateApplied: "", addedAt: Date.now(),
-          snapshot: { title: opp.title, organization: opp.organization, deadline: opp.deadline, type: opp.type, applyUrl: opp.applyUrl },
+          snapshot: {
+            title: opp.title, organization: opp.organization, deadline: opp.deadline,
+            deadlineEstimated: !!opp.deadlineEstimated, type: opp.type, applyUrl: opp.applyUrl,
+          },
         },
       },
     };
@@ -957,14 +1102,14 @@ export default function CMUOpportunityHub() {
     downloadFile("cmu-opportunity-hub-export.json", JSON.stringify(payload, null, 2), "application/json");
   };
   const exportCSV = () => {
-    const rows = [["source", "title", "organization", "type", "deadline", "status", "dateApplied", "note", "applyUrl"]];
+    const rows = [["source", "title", "organization", "type", "deadline", "deadlineIsEstimate", "status", "dateApplied", "note", "applyUrl"]];
     Object.entries(userData.tracker).forEach(([id, t]) => {
       const s = t.snapshot || byId[id] || {};
-      rows.push(["tracker", s.title, s.organization, s.type, s.deadline, t.status, t.dateApplied, userData.notes[id] || "", s.applyUrl]);
+      rows.push(["tracker", s.title, s.organization, s.type, s.deadline, s.deadlineEstimated ? "yes" : "", t.status, t.dateApplied, userData.notes[id] || "", s.applyUrl]);
     });
     userData.saved.forEach((id) => {
       const o = byId[id]; if (!o) return;
-      rows.push(["saved", o.title, o.organization, o.type, o.deadline, "", "", userData.notes[id] || "", o.applyUrl]);
+      rows.push(["saved", o.title, o.organization, o.type, o.deadline, o.deadlineEstimated ? "yes" : "", "", "", userData.notes[id] || "", o.applyUrl]);
     });
     downloadFile("cmu-opportunity-hub-export.csv", rows.map((r) => r.map(csvEscape).join(",")).join("\n"), "text/csv");
   };
@@ -974,6 +1119,22 @@ export default function CMUOpportunityHub() {
     filters.types.length + filters.tags.length +
     (filters.loc !== "all" ? 1 : 0) + (filters.paid !== "all" ? 1 : 0) +
     (filters.year !== "all" ? 1 : 0) + (filters.savedOnly ? 1 : 0) + (filters.showHidden ? 1 : 0);
+
+  // The modal's arrows walk whichever list it was opened from, minus anything
+  // that has since dropped out of the data.
+  const openModal = useCallback((id, ids) => {
+    setModalIds(Array.isArray(ids) && ids.length ? ids : [id]);
+    setModalId(id);
+  }, []);
+  const navIds = useMemo(() => modalIds.filter((id) => byId[id]), [modalIds, byId]);
+  const navIndex = navIds.indexOf(modalId);
+  const goRelative = useCallback((delta) => {
+    setModalId((current) => {
+      const i = navIds.indexOf(current);
+      const next = i + delta;
+      return i === -1 || next < 0 || next >= navIds.length ? current : navIds[next];
+    });
+  }, [navIds]);
 
   const modalOpp = modalId ? byId[modalId] : null;
 
@@ -1021,6 +1182,11 @@ export default function CMUOpportunityHub() {
                   onChange={(e) => setSettings((s) => ({ ...s, autoRefresh: e.target.checked }))} />
                 Auto-refresh every 6 hours while this tab is open
               </label>
+              <label className="flex items-center gap-2 cursor-pointer" title={ESTIMATE_TOOLTIP}>
+                <input type="checkbox" checked={settings.estimateDeadlines}
+                  onChange={(e) => setSettings((s) => ({ ...s, estimateDeadlines: e.target.checked }))} />
+                Estimate missing deadlines (~2 weeks after posting)
+              </label>
               <span className="text-xs sm:hidden" style={{ color: "#B9B5AE" }}>
                 Last updated: {lastUpdated ? timeAgo(lastUpdated) : "never"}
               </span>
@@ -1029,6 +1195,7 @@ export default function CMUOpportunityHub() {
                 <button onClick={exportCSV} className="px-2 py-1 rounded text-xs font-semibold" style={{ background: "#4A4844" }}>Export CSV</button>
               </div>
               <SyncPanel />
+              <FeedsPanel feeds={settings.feeds} setFeeds={(feeds) => setSettings((s) => ({ ...s, feeds }))} />
             </div>
           </div>
         )}
@@ -1071,7 +1238,8 @@ export default function CMUOpportunityHub() {
             style={{ background: "#FFFDF5", border: `1px solid ${C.line}` }}>
             <span className="font-semibold" style={{ fontFamily: SERIF }}>Internship listings update live for free — no key needed. </span>
             To also discover CMU research, REU, hackathon, and AI-curated internship openings, add a free Gemini API key
-            (no credit card) to <code>.env.local</code> — see the README.
+            (no credit card) to <code>.env.local</code> — see the README. You can add more job boards any time under
+            <b> ⚙ → Job board feeds</b>, no key required.
           </div>
         )}
         {!settings.introDismissed && (
@@ -1093,7 +1261,7 @@ export default function CMUOpportunityHub() {
           <div className="mt-3 px-4 py-3 rounded-lg text-sm" style={{ background: "#FBE9EC", border: "1px solid #F0C6CE" }}>
             <span className="font-bold" style={{ color: C.redDark }}>⏰ Due in the next 3 days: </span>
             {dueSoon.map((o, i) => (
-              <button key={o.id} onClick={() => setModalId(o.id)} className="underline font-medium hover:opacity-70" style={{ color: C.redDark }}>
+              <button key={o.id} onClick={() => openModal(o.id, dueSoon.map((x) => x.id))} className="underline font-medium hover:opacity-70" style={{ color: C.redDark }}>
                 {o.title}{i < dueSoon.length - 1 ? "," : ""}&nbsp;
               </button>
             ))}
@@ -1113,7 +1281,7 @@ export default function CMUOpportunityHub() {
             sortBy={sortBy} setSortBy={setSortBy}
             showFilters={showFilters} setShowFilters={setShowFilters}
             allTags={allTags} activeFilterCount={activeFilterCount} clearFilters={clearFilters}
-            saved={userData.saved} toggleSave={toggleSave} openModal={setModalId}
+            saved={userData.saved} toggleSave={toggleSave} openModal={openModal}
             hidden={userData.hidden} toggleHidden={toggleHidden}
             refreshing={refreshing}
           />
@@ -1121,25 +1289,26 @@ export default function CMUOpportunityHub() {
         {view === "calendar" && (
           <CalendarView
             opportunities={visible} calMonth={calMonth} setCalMonth={setCalMonth}
-            calSelected={calSelected} setCalSelected={setCalSelected} openModal={setModalId}
+            calSelected={calSelected} setCalSelected={setCalSelected} openModal={openModal}
           />
         )}
         {view === "tracker" && (
           <TrackerView
             userData={userData} byId={byId}
             setTrackerField={setTrackerField} removeFromTracker={removeFromTracker}
-            setNote={setNote} openModal={setModalId} exportJSON={exportJSON} exportCSV={exportCSV}
+            setNote={setNote} openModal={openModal} exportJSON={exportJSON} exportCSV={exportCSV}
             goBrowse={() => setView("browse")}
           />
         )}
         {view === "dashboard" && (
-          <DashboardView opportunities={visible} userData={userData} openModal={setModalId} />
+          <DashboardView opportunities={visible} userData={userData} openModal={openModal} />
         )}
       </main>
 
       {/* ------------------------------- Modal ------------------------------- */}
       {modalOpp && (
         <DetailModal
+          key={modalOpp.id}
           opp={modalOpp} onClose={() => setModalId(null)}
           saved={userData.saved.includes(modalOpp.id)} toggleSave={() => toggleSave(modalOpp.id)}
           inTracker={!!userData.tracker[modalOpp.id]} addToTracker={() => addToTracker(modalOpp)}
@@ -1148,6 +1317,8 @@ export default function CMUOpportunityHub() {
           edited={!!userData.overrides[modalOpp.id]}
           onSaveEdit={(fields) => saveEdit(modalOpp.id, fields)}
           onResetEdit={() => resetEdit(modalOpp.id)}
+          navIndex={navIndex} navTotal={navIds.length}
+          onPrev={() => goRelative(-1)} onNext={() => goRelative(1)}
         />
       )}
 
@@ -1174,6 +1345,10 @@ function BrowseView(props) {
     allTags, activeFilterCount, clearFilters, saved, toggleSave, openModal,
     hidden, toggleHidden, refreshing,
   } = props;
+
+  // Captured when a card is opened so the modal's arrows follow the list the
+  // user is actually looking at — current filters, current sort.
+  const filteredIds = useMemo(() => filtered.map((o) => o.id), [filtered]);
 
   const toggleType = (t) => setFilters((f) => ({
     ...f, types: f.types.includes(t) ? f.types.filter((x) => x !== t) : [...f.types, t],
@@ -1330,7 +1505,7 @@ function BrowseView(props) {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {filtered.map((o) => (
             <OppCard key={o.id} o={o} saved={saved.includes(o.id)} toggleSave={() => toggleSave(o.id)}
-              isHidden={hidden.includes(o.id)} toggleHidden={() => toggleHidden(o.id)} onOpen={() => openModal(o.id)} />
+              isHidden={hidden.includes(o.id)} toggleHidden={() => toggleHidden(o.id)} onOpen={() => openModal(o.id, filteredIds)} />
           ))}
         </div>
       ) : (
@@ -1349,7 +1524,7 @@ function BrowseView(props) {
             </thead>
             <tbody>
               {filtered.map((o) => (
-                <tr key={o.id} onClick={() => openModal(o.id)} className="cursor-pointer hover:bg-black hover:bg-opacity-5"
+                <tr key={o.id} onClick={() => openModal(o.id, filteredIds)} className="cursor-pointer hover:bg-black hover:bg-opacity-5"
                   style={{ borderBottom: `1px solid ${C.line}`, opacity: hidden.includes(o.id) ? 0.55 : 1 }}>
                   <td className="px-3 py-2 whitespace-nowrap">
                     <Star on={saved.includes(o.id)} onClick={() => toggleSave(o.id)} />
@@ -1361,7 +1536,7 @@ function BrowseView(props) {
                   </td>
                   <td className="px-3 py-2"><TypeBadge type={o.type} /></td>
                   <td className="px-3 py-2 text-xs" style={{ color: C.iron }}>{o.remote ? "Remote · " : ""}{o.location}</td>
-                  <td className="px-3 py-2"><DeadlinePill deadline={o.deadline} /></td>
+                  <td className="px-3 py-2"><DeadlinePill deadline={o.deadline} estimated={o.deadlineEstimated} /></td>
                   <td className="px-3 py-2 text-xs" style={{ color: C.iron }}>{o.compensation}</td>
                   <td className="px-3 py-2 text-xs" style={{ color: C.iron }}>{o.eligibility}</td>
                 </tr>
@@ -1403,7 +1578,7 @@ function OppCard({ o, saved, toggleSave, isHidden, toggleHidden, onOpen }) {
       </div>
       <div className="flex flex-wrap gap-1.5 items-center">
         <TypeBadge type={o.type} />
-        <DeadlinePill deadline={o.deadline} />
+        <DeadlinePill deadline={o.deadline} estimated={o.deadlineEstimated} />
       </div>
       <div className="text-xs" style={{ color: C.iron }}>
         {o.remote ? "🌐 Remote · " : "📍 "}{o.location}
@@ -1415,13 +1590,27 @@ function OppCard({ o, saved, toggleSave, isHidden, toggleHidden, onOpen }) {
 }
 
 /* ============================== DETAIL MODAL ============================== */
-function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker, note, setNote, isHidden, toggleHidden, edited, onSaveEdit, onResetEdit }) {
+function DetailModal({
+  opp, onClose, saved, toggleSave, inTracker, addToTracker, note, setNote,
+  isHidden, toggleHidden, edited, onSaveEdit, onResetEdit,
+  navIndex, navTotal, onPrev, onNext,
+}) {
   const [editing, setEditing] = useState(false);
+  const hasPrev = navIndex > 0;
+  const hasNext = navIndex >= 0 && navIndex < navTotal - 1;
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e) => {
+      if (e.key === "Escape") { onClose(); return; }
+      if (editing || (e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+      // Leave the arrows alone inside the notes box and the edit form.
+      const t = e.target;
+      if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
+      e.preventDefault();
+      if (e.key === "ArrowLeft") onPrev(); else onNext();
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, onPrev, onNext, editing]);
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-6"
       style={{ background: "rgba(20,19,17,0.55)" }} onClick={onClose}>
@@ -1439,7 +1628,7 @@ function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker,
           <div className="flex-1">
             <div className="flex items-center gap-2 flex-wrap mb-1">
               <TypeBadge type={opp.type} />
-              <DeadlinePill deadline={opp.deadline} />
+              <DeadlinePill deadline={opp.deadline} estimated={opp.deadlineEstimated} />
               {isNew(opp) && <NewBadge />}
               {edited && (
                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider"
@@ -1453,16 +1642,37 @@ function DetailModal({ opp, onClose, saved, toggleSave, inTracker, addToTracker,
             <h2 className="leading-tight" style={{ fontFamily: SERIF, fontSize: 24 }}>{opp.title}</h2>
             <div className="text-sm mt-0.5" style={{ color: C.iron }}>{opp.organization}</div>
           </div>
-          <button onClick={onClose} className="text-2xl leading-none px-2 hover:opacity-60" style={{ color: C.iron }}>×</button>
+          <div className="flex items-center gap-1">
+            {navTotal > 1 && (
+              <div className="flex items-center gap-1 mr-1 text-xs whitespace-nowrap" style={{ color: C.iron }}>
+                <button onClick={onPrev} disabled={!hasPrev} aria-label="Previous opportunity" title="Previous (←)"
+                  className="px-2 py-1 rounded font-bold disabled:opacity-30"
+                  style={{ background: C.mist, color: C.ink }}>‹</button>
+                <span>{navIndex + 1} / {navTotal}</span>
+                <button onClick={onNext} disabled={!hasNext} aria-label="Next opportunity" title="Next (→)"
+                  className="px-2 py-1 rounded font-bold disabled:opacity-30"
+                  style={{ background: C.mist, color: C.ink }}>›</button>
+              </div>
+            )}
+            <button onClick={onClose} className="text-2xl leading-none px-2 hover:opacity-60" style={{ color: C.iron }}>×</button>
+          </div>
         </div>
 
         <p className="text-sm mt-4 leading-relaxed">{opp.description || "No description available — check the application page for details."}</p>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 mt-4 text-sm">
           <div><span className="font-semibold">Location: </span>{opp.remote ? "Remote · " : ""}{opp.location}</div>
-          <div><span className="font-semibold">Deadline: </span>{fmtDeadline(opp.deadline)}</div>
+          <div>
+            <span className="font-semibold">Deadline: </span>{fmtDeadline(opp.deadline)}
+            {opp.deadlineEstimated && (
+              <span title={ESTIMATE_TOOLTIP} style={{ color: C.warn }}> · estimated — confirm on the listing</span>
+            )}
+          </div>
           <div><span className="font-semibold">Compensation: </span>{opp.compensation}</div>
           <div><span className="font-semibold">Eligibility: </span>{opp.eligibility}</div>
+          {opp.postedAt && (
+            <div><span className="font-semibold">Posted: </span>{new Date(opp.postedAt).toLocaleDateString()}</div>
+          )}
         </div>
 
         {opp.tags && opp.tags.length > 0 && (
@@ -1712,8 +1922,9 @@ function CalendarView({ opportunities, calMonth, setCalMonth, calSelected, setCa
                   }}>{d}</div>
                 {items.slice(0, 2).map((o) => (
                   <div key={o.id} className="mt-1 text-[10px] leading-tight font-semibold truncate px-1 py-0.5 rounded"
-                    style={{ background: "#FBE9EC", color: C.redDark }}>
-                    {o.title}
+                    style={{ background: "#FBE9EC", color: C.redDark }}
+                    title={o.deadlineEstimated ? `${o.title} — ${ESTIMATE_TOOLTIP}` : o.title}>
+                    {o.deadlineEstimated ? "~" : ""}{o.title}
                   </div>
                 ))}
                 {items.length > 2 && <div className="text-[10px] mt-0.5" style={{ color: C.faint }}>+{items.length - 2} more</div>}
@@ -1731,10 +1942,12 @@ function CalendarView({ opportunities, calMonth, setCalMonth, calSelected, setCa
           {selectedList.length === 0 ? (
             <div className="text-sm" style={{ color: C.iron }}>No deadlines on this date. A quiet day — good time to draft essays.</div>
           ) : selectedList.map((o) => (
-            <button key={o.id} onClick={() => openModal(o.id)}
+            <button key={o.id} onClick={() => openModal(o.id, selectedList.map((x) => x.id))}
               className="w-full text-left flex items-center gap-2 py-2 hover:opacity-70" style={{ borderBottom: `1px solid ${C.line}` }}>
               <TypeBadge type={o.type} />
-              <span className="font-semibold text-sm">{o.title}</span>
+              <span className="font-semibold text-sm">
+                {o.deadlineEstimated && <span title={ESTIMATE_TOOLTIP}>~</span>}{o.title}
+              </span>
               <span className="text-xs" style={{ color: C.iron }}>· {o.organization}</span>
             </button>
           ))}
@@ -1748,7 +1961,7 @@ function CalendarView({ opportunities, calMonth, setCalMonth, calSelected, setCa
           </h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
             {rolling.map((o) => (
-              <button key={o.id} onClick={() => openModal(o.id)}
+              <button key={o.id} onClick={() => openModal(o.id, rolling.map((x) => x.id))}
                 className="text-left p-3 rounded-lg hover:shadow-sm transition-shadow"
                 style={{ background: C.card, border: `1px solid ${C.line}`, borderLeft: `4px solid ${C.rolling}` }}>
                 <div className="font-semibold text-sm">{o.title}</div>
@@ -1778,6 +1991,13 @@ function TrackerView({ userData, byId, setTrackerField, removeFromTracker, setNo
   }, [entries]);
 
   const oppFor = (id, t) => byId[id] || t.snapshot || { title: "Removed listing", organization: "", deadline: "Rolling", type: "Research" };
+
+  // Left-to-right, top-to-bottom across the board, so the modal's arrows walk
+  // the tracker in the order it reads.
+  const trackerIds = useMemo(
+    () => STAGES.flatMap((stage) => cardsByStage[stage].map(([id]) => id)).filter((id) => byId[id]),
+    [cardsByStage, byId]
+  );
 
   if (entries.length === 0) {
     return (
@@ -1828,11 +2048,11 @@ function TrackerView({ userData, byId, setTrackerField, removeFromTracker, setNo
                     onDragEnd={() => setDragId(null)}
                     className="rounded-lg p-3 cursor-grab active:cursor-grabbing"
                     style={{ background: C.card, border: `1px solid ${C.line}`, opacity: dragId === id ? 0.5 : 1 }}>
-                    <button onClick={() => byId[id] && openModal(id)} className="text-left w-full">
+                    <button onClick={() => byId[id] && openModal(id, trackerIds)} className="text-left w-full">
                       <div className="font-semibold text-sm leading-snug">{o.title}</div>
                       <div className="text-xs mt-0.5" style={{ color: C.iron }}>{o.organization}</div>
                     </button>
-                    <div className="mt-2"><DeadlinePill deadline={o.deadline} /></div>
+                    <div className="mt-2"><DeadlinePill deadline={o.deadline} estimated={o.deadlineEstimated} /></div>
                     <select value={t.status} onChange={(e) => setTrackerField(id, "status", e.target.value)}
                       className="mt-2 w-full text-xs px-1.5 py-1 rounded" style={{ border: `1px solid ${C.line}` }}>
                       {STAGES.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -1942,10 +2162,10 @@ function DeadlineList({ title, items, empty, openModal, urgent }) {
       {items.length === 0 ? (
         <div className="text-sm py-4" style={{ color: C.faint }}>{empty}</div>
       ) : items.map((o) => (
-        <button key={o.id} onClick={() => openModal(o.id)}
+        <button key={o.id} onClick={() => openModal(o.id, items.map((x) => x.id))}
           className="w-full flex items-center gap-2 py-2 text-left hover:opacity-70" style={{ borderBottom: `1px solid ${C.line}` }}>
           <span className="text-sm font-semibold flex-1">{o.title}</span>
-          <DeadlinePill deadline={o.deadline} />
+          <DeadlinePill deadline={o.deadline} estimated={o.deadlineEstimated} />
         </button>
       ))}
     </div>
