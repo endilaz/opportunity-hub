@@ -1028,6 +1028,8 @@ export default function CMUOpportunityHub() {
         return va - vb;
       },
       recent: (a, b) => (b.fetchedAt || 0) - (a.fetchedAt || 0),
+      oldtonew: (a, b) => (a.fetchedAt || 0) - (b.fetchedAt || 0),
+      company: (a, b) => (a.organization.localeCompare(b.organization)),
       type: (a, b) => a.type.localeCompare(b.type) || a.title.localeCompare(b.title),
       alpha: (a, b) => a.title.localeCompare(b.title),
       compensation: (a, b) => compValue(b.compensation) - compValue(a.compensation),
@@ -1369,6 +1371,8 @@ function BrowseView(props) {
           className="px-2 py-2 rounded-lg text-sm" style={{ background: C.card, border: `1px solid ${C.line}` }}>
           <option value="deadline">Sort: deadline (soonest)</option>
           <option value="recent">Sort: recently added</option>
+          <option value="oldtonew">Sort: old to newly added</option>
+          <option value="company">Sort: company A - Z</option>
           <option value="type">Sort: type</option>
           <option value="alpha">Sort: A → Z</option>
           <option value="compensation">Sort: compensation</option>
